@@ -1,11 +1,13 @@
 [package]
-name = "log-trimmer"
+name = "cardio"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bloomfilter = "3.0.2"
+clap = { version = "4.6.7", features = ["derive"] }
 regex = "1.13.1"
 reqwest = "0.13.5"
-serde = "1.0.229"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = "1.53.2"
