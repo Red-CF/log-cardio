@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Red-CF/log-cardio/graph/badge.svg)](https://codecov.io/gh/Red-CF/log-cardio)
+[![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
 
 Fast Rust CLI that trims the fat from logs — fewer tokens for LLM agents.
 Logs can be GBs: cardio streams line by line with near-constant memory

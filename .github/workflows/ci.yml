@@ -45,33 +45,51 @@ jobs:
       - run: cargo llvm-cov --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
 
+  version:
+    # the merge gate: a PR must bump Cargo.toml above what crates.io has,
+    # or the merge button stays locked (the release job's auto-bump only
+    # covers the rare post-check race of two near-simultaneous merges)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: version must be new to crates.io
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          PUBLISHED=""
+          # retry: a single bad response from the registry mustn't lock merging
+          for i in 1 2 3; do
+            PUBLISHED=$(curl -sfL -A "log-cardio-ci" "https://crates.io/api/v1/crates/log-cardio/versions" | jq -r --arg v "$V" '[.versions[].num | select(. == $v)] | length' 2>/dev/null) || true
+            [ -n "$PUBLISHED" ] && break
+            sleep 3
+          done
+          [ -n "$PUBLISHED" ] || { echo "::error::registry query failed after 3 tries — retry the check"; exit 1; }
+          if [ "$PUBLISHED" != "0" ]; then
+            echo "::error::log-cardio $V is already on crates.io — bump version in Cargo.toml before merging"
+            exit 1
+          fi
+
   release:
-    # a merge to main ships the crate when the PR bumped the version in
-    # Cargo.toml; same version merged again = nothing published
+    # a merge to main ships the crate at the version the PR bumped to (the
+    # required `version` check guarantees that version isn't on crates.io
+    # yet; a same-version double merge would fail here — bump and re-merge)
     needs: [test, build, coverage]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - id: ver
-        run: |
-          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          PUBLISHED=$(curl -sfL https://crates.io/api/v1/crates/log-cardio | jq -r .crate.max_version)
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          [ "$V" != "$PUBLISHED" ] && echo "new=yes" >> "$GITHUB_OUTPUT" || true
       - name: cargo publish
-        if: steps.ver.outputs.new == 'yes'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
       - name: tag + GitHub release
-        if: steps.ver.outputs.new == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           git config user.name "Red-CF"
           git config user.email "crojasfer31@gmail.com"
-          git tag "v${{ steps.ver.outputs.version }}"
-          git push origin "v${{ steps.ver.outputs.version }}"
-          gh release create "v${{ steps.ver.outputs.version }}" --generate-notes
+          git tag "v$V"
+          git push origin "v$V"
+          gh release create "v$V" --generate-notes
