@@ -31,7 +31,8 @@ struct Args {
     #[arg(long)]
     dedup: bool,
 
-    /// Max number of lines to output (event count in trace mode; ignored with --stats)
+    /// Keep only the LAST N lines — the most recent beat the old (whole
+    /// input reads; event count in trace mode; ignored with --stats)
     #[arg(long)]
     max_lines: Option<usize>,
 
@@ -467,6 +468,9 @@ struct RunResult {
     session_lines_capped: bool,
     dedup_inserts: usize,
     dropped_dups: usize,
+    // Stream mode: the --tail/lean window overflowed (input had more kept
+    // lines than the window) — feeds the "kept the last N" stderr note
+    window_full: bool,
 }
 
 /// Input source: byte lines (file/stdin/gcloud) or decoded bq CSV rows.
@@ -680,6 +684,11 @@ fn make_reader(
     until_valid: &Option<String>,
 ) -> (Source, Option<(&'static str, Child)>) {
     if let Some(filter) = &args.gcloud {
+        // The agent's most expensive mistake: an unbounded Cloud Logging
+        // read streams the whole retention window. Never launch it silent.
+        if since_valid.is_none() {
+            eprintln!("Warning: no --since — this gcloud call streams the WHOLE matching range, oldest first. Add --since unless you truly want everything.");
+        }
         let mut gc_filter = filter.clone();
         // bounds already canonicalized: no space separator remains. Pushdown
         // is second-precision (server_ts / until_server_bound): since >= its
@@ -700,8 +709,8 @@ fn make_reader(
             "--format".into(), "value(timestamp,textPayload,jsonPayload.message)".into(),
             "--order=asc".into(),
         ];
-        // ponytail: no --limit pushdown for --max-lines; the early-cut kill
-        // already bounds the download.
+        // ponytail: no --limit pushdown; the fetch is bounded by your query
+        // (and by the pushdown bounds above)
         let (stdout, child) = spawn_fetcher("gcloud", gc_args);
         (Source::Lines(Box::new(BufReader::new(stdout))), Some(("gcloud", child)))
     } else if let Some(sql) = &args.bq {
@@ -737,24 +746,18 @@ fn run_stream(
     mut bloom: Option<&mut Bloom<String>>,
     args: &Args,
     outbuf: &mut Sink,
-) -> (usize, usize) {
-    let mut count = 0usize;
+) -> (usize, usize, bool) {
     let mut dedup_inserts = 0usize;
     let mut dropped_dups = 0usize;
-    // --tail: ring buffer of the last N KEPT lines, emitted after the
-    // loop. The whole input is read, so the line cap does not apply
-    // here; the tail value is the only window.
+    // --tail or the lean/--max-lines cap: one window of the last N KEPT
+    // lines, emitted after the loop. Recent beats old (agents read "what is
+    // happening now", so the cap sacrifices the head of the range), and the
+    // whole input is read — a cap no longer ends a stream early.
+    let window_n = args.tail.or(args.max_lines);
     let mut tail_buf: VecDeque<(usize, String)> =
-        args.tail.map(|n| VecDeque::with_capacity(n)).unwrap_or_default();
+        window_n.map(|n| VecDeque::with_capacity(n)).unwrap_or_default();
+    let mut window_full = false;
     while let Some((line_no, line)) = proc.next_trimmed() {
-        if args.tail.is_none() {
-            if let Some(max) = args.max_lines {
-                if count >= max {
-                    proc.early_cut = true;
-                    break;
-                }
-            }
-        }
         if let Some(ref mut b) = bloom {
             // single probe: check + insert in one hash pass
             if b.check_and_set(&line) {
@@ -764,10 +767,11 @@ fn run_stream(
             // Track actual insertions: saturating past capacity = silent data loss
             dedup_inserts += 1;
         }
-        if let Some(n) = args.tail {
+        if let Some(n) = window_n {
             // line_no preserved so --tail --json keeps input indices
             if tail_buf.len() >= n {
                 tail_buf.pop_front();
+                window_full = true;
             }
             tail_buf.push_back((line_no, line));
             continue;
@@ -782,9 +786,9 @@ fn run_stream(
         } else {
             emit(outbuf, &line);
         }
-        count += 1;
     }
-    // --tail: emit the buffered window (json kept in input-line order)
+    // tail/cap window: emit the buffered window (json kept in input-line
+    // order)
     for (line_no, line) in tail_buf {
         if args.json {
             let json = serde_json::to_string(&LogEntry {
@@ -796,7 +800,7 @@ fn run_stream(
             emit(outbuf, &line);
         }
     }
-    (dedup_inserts, dropped_dups)
+    (dedup_inserts, dropped_dups, window_full)
 }
 
 /// Stats mode: survey the whole file; returns counts + whether capped.
@@ -1077,6 +1081,7 @@ fn main() {
                 session_lines_capped: false,
                 dedup_inserts: 0,
                 dropped_dups: 0,
+                window_full: false,
             }
         }
         Run::Sessions => {
@@ -1090,10 +1095,11 @@ fn main() {
                 session_lines_capped,
                 dedup_inserts: 0,
                 dropped_dups: 0,
+                window_full: false,
             }
         }
         Run::Stream => {
-            let (dedup_inserts, dropped_dups) = run_stream(&mut proc, bloom.as_mut(), &args, &mut outbuf);
+            let (dedup_inserts, dropped_dups, window_full) = run_stream(&mut proc, bloom.as_mut(), &args, &mut outbuf);
             RunResult {
                 stats_map: None,
                 sessions: None,
@@ -1102,6 +1108,7 @@ fn main() {
                 session_lines_capped: false,
                 dedup_inserts,
                 dropped_dups,
+                window_full,
             }
         }
     };
@@ -1127,6 +1134,12 @@ fn main() {
             "Note: dedup dropped {} duplicate-suspect line{} (a few may actually be unique — --raw keeps everything).",
             result.dropped_dups,
             if result.dropped_dups == 1 { "" } else { "s" }
+        );
+    }
+    if result.window_full && args.tail.is_none() {
+        eprintln!(
+            "Note: kept the last {} lines — the most recent; the rest of the input was read and trimmed (--raw removes the cap; --query TEXT narrows before reading).",
+            args.max_lines.unwrap_or(0)
         );
     }
     if early_cut {

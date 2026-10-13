@@ -537,14 +537,16 @@ fn default_pipeline_dedups_and_caps_raw_skips_it() {
     let p = path.0.to_string_lossy().into_owned();
 
     let out = cardio(&[&p]);
-    // the two "repeated start" lines collapse to the first (dedup)
+    // the two "repeated start" lines collapse to the first (dedup) — but
+    // the window is the LAST 2000 KEPT lines: the head (kept once by dedup,
+    // then unique-0000..0099) slid OUT, recent beats old
     let count = out.matches("repeated start").count();
-    assert_eq!(count, 1, "dedup should keep one, got {count}");
-    // cap: 2000 output lines, unique-1999 onward never printed
-    assert!(out.contains("unique-1998") && !out.contains("unique-1999"), "cap 2000 missed");
-    // explicit --max-lines overrides the default cap
+    assert_eq!(count, 0, "head of the range must leave the window, got {count}");
+    assert!(out.contains("unique-2099") && !out.contains("unique-0099"), "cap 2000 must keep the most recent");
+    // explicit --max-lines overrides the default cap (same tail semantics)
     let capped = cardio(&["--max-lines", "5", &p]);
-    assert!(capped.lines().count() <= 5, "got {}", capped.lines().count());
+    assert_eq!(capped.lines().count(), 5, "got {}", capped.lines().count());
+    assert!(capped.contains("unique-2099"), "explicit cap keeps the latest: {capped:?}");
     // --raw: no dedup, no cap — both repeats and every unique survive
     let raw = cardio(&["--raw", &p]);
     assert_eq!(raw.matches("repeated start").count(), 2, "--raw must keep repeats");
@@ -589,7 +591,7 @@ fn lean_signals_what_it_dropped() {
     assert!(out.status.success(), "got: {:?}", out.status);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("dedup dropped 1 duplicate-suspect line"), "got: {err:?}");
-    assert!(!err.contains("--max-lines cap"), "no cap in a short run: {err:?}");
+    assert!(!err.contains("kept the last"), "no cap in a short run: {err:?}");
 
     let big: String = (0..2001).map(|i| format!("2026-10-09T12:{:02}:{:02} u{i:04}\n", i / 60, i % 60)).collect();
     let path = fixture(&big);
@@ -599,7 +601,8 @@ fn lean_signals_what_it_dropped() {
         .output()
         .expect("cardio binary should run");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--max-lines cap"), "cap signal missing: {err:?}");
+    assert!(err.contains("kept the last 2000 lines"), "cap signal missing: {err:?}");
+    assert!(!err.contains("the rest of the input was not read"), "no early-cut in lean: {err:?}");
 }
 
 #[test]

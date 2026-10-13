@@ -18,26 +18,28 @@ cardio --bq 'SELECT text AS log FROM prod.traces'
 ```
 
 **Default pipeline is lean**: trim + boilerplate stripped + dedup on +
-output capped at 2000 lines (`--max-lines N` overrides). No flags needed —
-this is the mode that keeps your context spend low.
+output keeps the LAST 2000 lines — the most recent (`--max-lines N`
+overrides). No flags needed — this is the mode that keeps your context
+spend low.
 
 **⚠ Default mode drops lines.** Two ways, both deliberate: duplicated
 whole lines are removed (Bloom filter, **~1% false positives — a UNIQUE
-line can be discarded as if repeated**), and output stops at 2000 lines.
-Correct trade for trimming noise, data loss when you're hunting one
-weird event. cardio never hides it: stderr says how many were dropped
-and that the cap cut the run. When any line might be THE answer:
-`--raw` (nothing dropped, nothing capped), or narrow with `--query`
+line can be discarded as if repeated**), and only the last 2000 lines
+survive — the HEAD of the range is trimmed away. Correct trade for
+trimming noise, data loss when you're hunting one weird event: cardio
+never hides it — stderr says how many were dropped and that the cap
+kept only the tail. When any line might be THE answer, or the error is
+old: `--raw` (nothing dropped, nothing capped), or narrow with `--query`
 to read everything you kept.
 
 ## Flags
 
 | Flag | Effect |
 |---|---|
-| `--tail N` | only the LAST N kept lines — reads the whole input, replaces the cap. The #1 read: "what does the log's latest say" |
+| `--tail N` | only the LAST N kept lines — the #1 read: "what does the log's latest say" |
 | `--raw` | skip the agent pipeline: no dedup, no cap (only trim still applies) |
 | `--query error` | keep only lines containing TEXT (substring) |
-| `--max-lines N` | cap output lines (raw mode: only when you pass it) |
+| `--max-lines N` | keep the LAST N lines — same tail semantics as --tail |
 | `--json` | NDJSON output: {"index","content"} |
 | `--since TS` / `--until TS` | keep lines with timestamp >= TS / < TS |
 | `--trace REGEX` | group lines by captured ID (e.g. request_id=...), sessions at end |
@@ -68,6 +70,8 @@ tz-naive — don't mix `+02:00` logs against UTC bounds.
   and is printed as-is; there is no warning for it today.
 - `--gcloud` mode: entries with NO payload (neither text nor json message)
   can't be carried by the current fetch format and are counted, not printed.
+  Without `--since` it streams the whole matching range (a warning fires
+  before the fetch).
 - Time ranges belong in the Google query itself when possible
   (`--gcloud` pushes `--since/--until` into its filter; `--bq` does not —
   filter in the SQL `WHERE` over the timestamp column).
