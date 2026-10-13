@@ -134,75 +134,86 @@ fn flush(outbuf: &mut Sink) {
     }
 }
 
-/// Padding for partial-precision ISO matches: date-only = day start,
-/// minute = ":00", so a partial ts never compares as a bare prefix below
-/// its own instant. 13 (hour-only) can never pass is_full_iso, so it has
-/// no arm. Single invariant shared by the line side and the bounds side.
-fn partial_pad(ts_len: usize) -> Option<&'static str> {
-    match ts_len {
-        10 => Some("T00:00:00"),
-        16 => Some(":00"),
-        _ => None,
-    }
-}
-
 /// Digit run after the '.' in a fractional instant: "45.5" → Some(1),
-/// "45.500" → Some(3); no dot, a tz suffix after the run ("45.5Z" still
-/// returns SOME(1) — the run itself) or 9+ digits (saturating: >9-digit
-/// fracs compare as-is, truncation is fine) → None when 0 or too long.
+/// no dot → None. The run itself (length), not padability.
 fn short_frac(s: &str) -> Option<usize> {
     let i = s.find('.')?;
-    let run = s[i + 1..].bytes().take_while(|b| b.is_ascii_digit()).count();
-    if run == 0 || run >= 9 { None } else { Some(run) }
+    Some(s[i + 1..].bytes().take_while(|b| b.is_ascii_digit()).count())
 }
 
-/// The one canonicalize-for-compare step: space→'T', pad partial precision
-/// and short fractions (zeros go at the frac run's END, before any tz
-/// suffix: "45.5Z" → "45.500000000Z", so 'Z' never sits in the frac slot
-/// of the lexicographic compare). Line normalization and canonical bounds
-/// both land here — one invariant, no drift.
-fn canonical_ts(s: &str) -> String {
-    let mut t = if s.len() > 10 && s.as_bytes()[10] == b' ' {
-        format!("{}T{}", &s[..10], &s[11..])
+/// THE single canonical-for-compare writer: space→'T' (" " < "T" would
+/// mis-order), date-only = day start, minute precision — tz-suffixed or
+/// not — pads to ":00", fractions normalize to exactly 9 digits (zeros go
+/// at the digit run's end, before any suffix; longer fracs truncate).
+/// Lines and bounds both land here — one invariant, no drift.
+fn to_canonical(s: &str, out: &mut String) {
+    out.clear();
+    if s.len() > 10 && s.as_bytes()[10] == b' ' {
+        out.push_str(&s[..10]);
+        out.push('T');
+        out.push_str(&s[11..]);
     } else {
-        s.to_string()
-    };
-    if let Some(p) = partial_pad(t.len()) {
-        t.push_str(p);
-    } else if let Some(run) = short_frac(&t) {
-        let at = t.find('.').unwrap() + 1 + run;
-        t.insert_str(at, &"0".repeat(9 - run));
+        out.push_str(s);
     }
-    t
+    let date_only = out.len() == 10;
+    let b = out.as_bytes();
+    // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
+    // is not the ':' that would start seconds (may be a tz suffix)
+    let minute_only = out.len() >= 16
+        && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':');
+    let dot_at = if b.contains(&b'.') { out.find('.') } else { None };
+    if date_only {
+        out.push_str("T00:00:00");
+        return;
+    }
+    if minute_only {
+        out.insert_str(16, ":00");
+    }
+    if let Some(i) = dot_at {
+        let run = out[i + 1..].bytes().take_while(|c| c.is_ascii_digit()).count();
+        if run < 9 {
+            for _ in 0..(9 - run) { out.insert(i + 1 + run, '0'); }
+        } else {
+            for _ in 0..(run - 9) { out.remove(i + 10); }
+        }
+    }
 }
 
-/// Normalize a matched timestamp for lexicographic compare (canonical_ts).
-/// Unchanged matches return the borrowed slice (no copy on the hot path);
-/// transformed ones are written into `buf` (reused per iteration).
-/// Callers gate on is_full_iso, so ts is at least a full date.
+/// Predicate mirroring to_canonical's transformations — both call sites
+/// use it, so the fast path can't drift from the writer. Unchanged
+/// matches keep the borrowed slice (no copy on the hot path).
+fn ts_canonical_needed(s: &str) -> bool {
+    let b = s.as_bytes();
+    (s.len() > 10 && b[10] == b' ')
+    || s.len() == 10
+    || short_frac(s).is_some()
+    || (s.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':'))
+}
+
+/// Normalize a matched timestamp for lexicographic compare (canonical).
 fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
-    let needs = (ts.len() > 10 && ts.as_bytes()[10] == b' ')
-        || partial_pad(ts.len()).is_some()
-        || short_frac(ts).is_some();
-    if !needs {
+    if !ts_canonical_needed(ts) {
         return ts;
     }
-    *buf = canonical_ts(ts);
+    to_canonical(ts, buf);
     buf.as_str()
 }
 
-/// Canonicalize bounds via the shared canonical_ts rule. ponytail: bounds
-/// normalized at this layer so callers can't forget the convention;
-/// offset handling stays tz-naive — chrono if that ever matters.
-
+/// Bounds canonicalize via to_canonical (space→T, padding, frac width).
 /// --until is <, so a DATE-ONLY bound means NEXT-day start: "--until 2026-10-09"
 /// keeps all of the 9th instead of excluding the whole end day. Padded
 /// precisions keep their instant (exclusive at the pad instant).
-fn canonical_until(s: &str) -> String {
-    // date-only check on the RAW bound: canonical_ts would pad it to day
-    // start, which as an exclusive bound excludes the whole end day
-    if s.len() == 10 { return next_day_start(s); }
-    canonical_ts(s)
+/// ponytail: bounds normalized at this layer so callers can't forget the
+/// convention; offset handling stays tz-naive — chrono if that ever matters.
+fn canonical_bound(s: &str, until: bool) -> String {
+    if until && s.len() == 10 {
+        // RAW date-only check: to_canonical would pad it to day start,
+        // which as an exclusive bound excludes the whole end day
+        return next_day_start(s);
+    }
+    let mut out = String::new();
+    to_canonical(s, &mut out);
+    out
 }
 
 /// One date increment, no chrono: manual month/leap arithmetic.
@@ -698,9 +709,9 @@ fn main() {
     // per line. Date-only bounds grow day-start (since) / next-day (until)
     // times so the end day isn't excluded wholesale; spaces become 'T'.
     let since_valid: Option<String> = args.since.as_ref()
-        .filter(|s| is_full_iso(s)).map(|s| canonical_ts(s));
+        .filter(|s| is_full_iso(s)).map(|s| canonical_bound(s, false));
     let until_valid: Option<String> = args.until.as_ref()
-        .filter(|u| is_full_iso(u)).map(|u| canonical_until(u));
+        .filter(|u| is_full_iso(u)).map(|u| canonical_bound(u, true));
     let range_filter = since_valid.is_some() || until_valid.is_some();
 
     let (reader, fetched_child) = make_reader(&args, &since_valid, &until_valid);

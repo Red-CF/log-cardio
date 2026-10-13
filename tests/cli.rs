@@ -316,6 +316,35 @@ fn fractional_seconds_compare_equal_at_bound() {
 }
 
 #[test]
+fn long_fraction_bound_truncates_comparable() {
+    // >9 frac digits: the bound truncates to 9, equal instants compare equal
+    let p1 = fixture("2026-10-09T12:34:45.1 event\n");
+    let p2 = fixture("2026-10-09T12:34:45.1 event\n");
+    let s1 = p1.0.to_string_lossy().into_owned();
+    let s2 = p2.0.to_string_lossy().into_owned();
+
+    let kept = cardio(&["--since", "2026-10-09T12:34:45.1000000000", &s1]);
+    assert!(kept.contains("event"), "equal instant passes inclusive bound, got: {kept:?}");
+    let dropped = cardio(&["--until", "2026-10-09T12:34:45.1000000000", &s2]);
+    assert!(!dropped.contains("event"), "equal instant fails exclusive bound, got: {dropped:?}");
+}
+
+#[test]
+fn tz_suffixed_minute_bound_pads_to_seconds() {
+    // "T12:34Z" is minute precision: pads to ":00" before the suffix,
+    // else ':' (0x3A) < 'Z' (0x5A) mis-orders every second-precision line
+    let p1 = fixture("2026-10-09T12:34:30 event\n");
+    let p2 = fixture("2026-10-09T12:34:30 event\n");
+    let s1 = p1.0.to_string_lossy().into_owned();
+    let s2 = p2.0.to_string_lossy().into_owned();
+
+    let kept = cardio(&["--since", "2026-10-09T12:34Z", &s1]);
+    assert!(kept.contains("event"), "mid-minute line passes the minute bound, got: {kept:?}");
+    let dropped = cardio(&["--until", "2026-10-09T12:34Z", &s2]);
+    assert!(!dropped.contains("event"), "mid-minute line must not cross the bound, got: {dropped:?}");
+}
+
+#[test]
 fn minute_precision_ts_pads_to_seconds() {
     // minute-precision line ts must pad to ":00": unpadded it sorts as a bare
     // prefix strictly below its own minute's second-precision bounds
