@@ -6,28 +6,22 @@ on:
   pull_request:
 
 jobs:
-  test:
-    # the platform contract: file/stdin plus spawning gcloud/bq behave
-    # differently per OS — needs a real run on all three. The Linux leg
-    # doubles as coverage: instrumented tests on main feed the gh-pages badge.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  cobertura:
+    # coverage lives on its own named check: instrumented tests on Linux +
+    # the gh-pages badge on main. Linux is covered here instead of `test` —
+    # test keeps macos/windows only.
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: tests + coverage (Linux leg, feeds the badge on main)
-        if: runner.os == 'Linux'
-        run: |
+      - run: |
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov
           cargo llvm-cov --lcov --output-path lcov.info
       - name: update gh-pages badge
-        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -41,9 +35,20 @@ jobs:
           git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add coverage.svg
           git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "coverage badge: $PCT%" --allow-empty
           git -C ghp push -q origin gh-pages
-      - name: tests
-        if: runner.os != 'Linux'
-        run: cargo test
+
+  test:
+    # the platform contract: file/stdin plus spawning gcloud/bq behave
+    # differently per OS — needs a real run on all three (Linux runs inside
+    # the `cobertura` job, which is instrumented)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
         # network-fetching tests are faked via PATH stubs (cfg(unix)) so
         # this works offline everywhere
 
