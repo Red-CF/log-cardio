@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -223,6 +221,7 @@ fn summary_last_is_exactly_one_event() {
     assert!(!out.contains("donereq"), "got: {out:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn bq_csv_rows_are_clean_events() {
     // header row, quoted comma field, empty-text row: no separator residue,
@@ -238,6 +237,7 @@ fn bq_csv_rows_are_clean_events() {
     assert_eq!(v["content"], "req_1 login, ok", "no separator residue: {stdout:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn bq_crlf_text_field_flattens_to_one_line() {
     // quoted field with CRLF breaks: the event must stay one line
@@ -250,6 +250,7 @@ fn bq_crlf_text_field_flattens_to_one_line() {
     assert_eq!(lines[0], "line1 line2 more x", "no CR residue: {stdout:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn bq_lone_cr_content_is_preserved() {
     // CR flattening must only eat CRLF pairs, never a lone CR's content
@@ -260,8 +261,10 @@ fn bq_lone_cr_content_is_preserved() {
 }
 
 /// Run cardio with a fake `bq` command on PATH that just prints `csv`.
+/// (unix-only: the fake is a shebang shell script.)
 /// Returns stdout; asserts exit status so a regression failing early is
 /// honest. Fakebin dir is unique per call and removed before returning.
+#[cfg(unix)]
 fn fake_bq(csv: &str, args: &[&str]) -> String {
     use std::os::unix::fs::PermissionsExt;
     let fake = std::env::temp_dir().join(format!(

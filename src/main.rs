@@ -146,66 +146,63 @@ fn partial_pad(ts_len: usize) -> Option<&'static str> {
     }
 }
 
-/// Fractional-second digits to add: "45.5" pads to 9 frac digits so equal
-/// instants compare EQUAL to "45.500000000", never below.
-fn short_frac_pad(s: &str) -> Option<usize> {
-    s.find('.').map(|i| 9 - (s.len() - i - 1)).filter(|&n| n > 0)
+/// Digit run after the '.' in a fractional instant: "45.5" → Some(1),
+/// "45.500" → Some(3); no dot, a tz suffix after the run ("45.5Z" still
+/// returns SOME(1) — the run itself) or 9+ digits (saturating: >9-digit
+/// fracs compare as-is, truncation is fine) → None when 0 or too long.
+fn short_frac(s: &str) -> Option<usize> {
+    let i = s.find('.')?;
+    let run = s[i + 1..].bytes().take_while(|b| b.is_ascii_digit()).count();
+    if run == 0 || run >= 9 { None } else { Some(run) }
 }
 
-fn pad_partial(s: &str) -> String {
-    if let Some(p) = partial_pad(s.len()) {
-        return format!("{}{}", s, p);
-    }
-    match short_frac_pad(s) {
-        Some(n) => format!("{}{}", s, "0".repeat(n)),
-        None => s.to_string(),
-    }
-}
-
-/// Normalize a matched timestamp for lexicographic compare against the
-/// "T"-separated bounds: a space separator converts to 'T' (" " < "T" would
-/// mis-order), partial precision and short fractions get padded. Callers
-/// gate on is_full_iso, so ts is at least a full date (no length guard
-/// needed). Result is written into `buf` (reused) and returned as &str;
-/// unchanged matches return the borrowed slice (no copy on the hot path).
-fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
-    let pads = partial_pad(ts.len());
-    let has_space = ts.len() > 10 && ts.as_bytes()[10] == b' ';
-    if has_space || pads.is_some() || short_frac_pad(ts).is_some() {
-        buf.clear();
-        if has_space {
-            buf.push_str(&ts[..10]);
-            buf.push('T');
-            buf.push_str(&ts[11..]);
-        } else {
-            buf.push_str(ts);
-        }
-        if let Some(p) = pads {
-            buf.push_str(p);
-        }
-        if let Some(n) = short_frac_pad(buf) {
-            for _ in 0..n { buf.push('0'); }
-        }
-        buf.as_str()
+/// The one canonicalize-for-compare step: space→'T', pad partial precision
+/// and short fractions (zeros go at the frac run's END, before any tz
+/// suffix: "45.5Z" → "45.500000000Z", so 'Z' never sits in the frac slot
+/// of the lexicographic compare). Line normalization and canonical bounds
+/// both land here — one invariant, no drift.
+fn canonical_ts(s: &str) -> String {
+    let mut t = if s.len() > 10 && s.as_bytes()[10] == b' ' {
+        format!("{}T{}", &s[..10], &s[11..])
     } else {
-        ts
+        s.to_string()
+    };
+    if let Some(p) = partial_pad(t.len()) {
+        t.push_str(p);
+    } else if let Some(run) = short_frac(&t) {
+        let at = t.find('.').unwrap() + 1 + run;
+        t.insert_str(at, &"0".repeat(9 - run));
     }
+    t
 }
 
-/// Canonicalize bounds via the shared partial_pad rule (date-only = day
-/// start; minute/hour precision = pad). ponytail: bounds normalized at this
-/// layer so callers can't forget the convention; offset handling stays
-/// tz-naive — chrono if that ever matters.
-fn canonical_since(s: &str) -> String {
-    pad_partial(&s.replacen(' ', "T", 1))
+/// Normalize a matched timestamp for lexicographic compare (canonical_ts).
+/// Unchanged matches return the borrowed slice (no copy on the hot path);
+/// transformed ones are written into `buf` (reused per iteration).
+/// Callers gate on is_full_iso, so ts is at least a full date.
+fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
+    let needs = (ts.len() > 10 && ts.as_bytes()[10] == b' ')
+        || partial_pad(ts.len()).is_some()
+        || short_frac(ts).is_some();
+    if !needs {
+        return ts;
+    }
+    *buf = canonical_ts(ts);
+    buf.as_str()
 }
+
+/// Canonicalize bounds via the shared canonical_ts rule. ponytail: bounds
+/// normalized at this layer so callers can't forget the convention;
+/// offset handling stays tz-naive — chrono if that ever matters.
 
 /// --until is <, so a DATE-ONLY bound means NEXT-day start: "--until 2026-10-09"
 /// keeps all of the 9th instead of excluding the whole end day. Padded
 /// precisions keep their instant (exclusive at the pad instant).
 fn canonical_until(s: &str) -> String {
-    let t = s.replacen(' ', "T", 1);
-    if t.len() == 10 { next_day_start(&t) } else { pad_partial(&t) }
+    // date-only check on the RAW bound: canonical_ts would pad it to day
+    // start, which as an exclusive bound excludes the whole end day
+    if s.len() == 10 { return next_day_start(s); }
+    canonical_ts(s)
 }
 
 /// One date increment, no chrono: manual month/leap arithmetic.
@@ -345,19 +342,15 @@ impl Pipeline {
                 if !line.contains(q) { continue; }
             }
 
-            // Time range: the line's FIRST timestamp match, wherever it sits
-            // (brackets/level prefixes are common), and it must be ISO —
-            // Apache format ("09/Oct/2026:...") also matches but sorts
-            // backwards lexicographically. ponytail: ts fields come first in
-            // real formats, so first-match is the intended ts; ISO strings
-            // sort chronologically and space separators normalize to 'T'.
+            // Time range: the first FULL-ISO match, wherever it sits
+            // (brackets/level prefixes are common): an invalid earlier
+            // match (bad calendar date) must not shield the line or
+            // shadow a valid ts later in it. Apache-style lines have no
+            // ISO match at all and bypass entirely.
+            // ponytail: ts fields come first in real formats, so the
+            // first full-ISO match is the intended ts; ISO strings sort
+            // chronologically and space separators normalize to 'T'.
             if self.range_filter {
-                // first FULL-ISO match, wherever it sits (brackets/level
-                // prefixes are common): an invalid earlier match (bad
-                // calendar date) must not shield the line or shadow a
-                // valid ts later in it. Apache-style lines have no ISO
-                // match at all and bypass. ponytail: ISO strings sort
-                // chronologically; space separators normalize to 'T'.
                 let lead = self.re_timestamp.find_iter(line)
                     .find(|m| is_full_iso(m.as_str()))
                     .map(|m| m.as_str());
@@ -705,7 +698,7 @@ fn main() {
     // per line. Date-only bounds grow day-start (since) / next-day (until)
     // times so the end day isn't excluded wholesale; spaces become 'T'.
     let since_valid: Option<String> = args.since.as_ref()
-        .filter(|s| is_full_iso(s)).map(|s| canonical_since(s));
+        .filter(|s| is_full_iso(s)).map(|s| canonical_ts(s));
     let until_valid: Option<String> = args.until.as_ref()
         .filter(|u| is_full_iso(u)).map(|u| canonical_until(u));
     let range_filter = since_valid.is_some() || until_valid.is_some();
