@@ -78,19 +78,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
-name = "cardio"
-version = "0.1.0"
-dependencies = [
- "bloomfilter",
- "clap",
- "csv",
- "regex",
- "serde",
- "serde_json",
- "toml",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -256,6 +243,19 @@ name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
+name = "log-cardio"
+version = "0.1.0"
+dependencies = [
+ "bloomfilter",
+ "clap",
+ "csv",
+ "regex",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "memchr"
