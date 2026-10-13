@@ -89,31 +89,49 @@ fn compile_regex(pattern: &str, source: &str) -> Regex {
     })
 }
 
-/// [0-9] over \d on purpose: regex \d is Unicode-aware and every byte
-/// check downstream (is_full_iso arithmetic, all_digits, truncate,
-/// shape gate) assumes ASCII digits — pinning the range retires the
-/// unicode-digit class at the VALIDATION grammar. Same pin applied to
-/// the default trim regex below; custom configs carrying \d re-open
+/// A frac may only follow SECONDS: a frac on minutes is not a real log
+/// grammar and is rejected like any other invalid ts.
+/// [0-9] over \d: regex \d is Unicode-aware and every byte check
+/// downstream (is_full_iso arithmetic, all_digits, truncate, shape
+/// gate) assumes ASCII digits — custom configs carrying \d re-open
 /// that leak at their own trim layer.
-/// ponytail: structural + calendar-sanity only — exact days-in-month
-/// and tz semantics stay out (chrono if needed).
-/// FRAC (built into the pattern here, matched alone in to_canonical)
-/// is the one frac-grammar home: widen it there, both widen.
-static FULL_ISO_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}([ T][0-9]{{2}}:[0-9]{{2}}(?::[0-9]{{2}}(?:{FRAC})?)?(?:Z|[+-][0-9]{{2}}:?[0-9]{{2}})?)?$"
-    ))
-    .unwrap()
+static FRAC: &str = r"\.[0-9]+";
+
+/// The unanchored full-ISO body — THE one ts-grammar home for
+/// validation AND (below, as TRIM_BODY) the default trim regex. Widen
+/// FRAC here (comma frac, etc.) and both follow. ponytail: structural
+/// + calendar-sanity only — exact days-in-month and tz semantics stay
+/// out (chrono if needed).
+static ISO_BODY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}(?:[ T][0-9]{{2}}:[0-9]{{2}}(?::[0-9]{{2}}(?:{FRAC})?)?(?:Z|[+-][0-9]{{2}}:?[0-9]{{2}})?)?"
+    )
 });
 
-/// The frac grammar, one home: embedded in FULL_ISO_RE's seconds group
-/// above and matched alone against a line ts tail in to_canonical's EOD
-/// branch — widen it here once (comma frac, etc.) and both follow. A
-/// frac may only follow SECONDS: a frac on minutes is not a real log
-/// grammar and is rejected like any other invalid ts.
-static FRAC: &str = r"\.[0-9]+";
+static FULL_ISO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!("^(?:{})$", *ISO_BODY)).unwrap()
+});
+
+/// The default trim grammar: TRIM_BODY = ISO_BODY with the time part
+/// made MANDATORY (a bare date can be content — "deployed on
+/// 2026-10-09" — and would be corrupted if trim stripped it; such
+/// lines bypass the range filter with the usual one-shot warn, which
+/// is the documented fallback). Seconds now optional: trim previously
+/// required them, so a valid minute-precision ts never reached the
+/// range gate and the line leaked past --since/--until (verified).
+/// The Apache month is [A-Za-z], not \w — \w is Unicode-aware and its
+/// match is trimmed-but-unvalidatable, the leak class above.
+/// ponytail: a mixed ascii/unicode ts match stops at the fullwidth
+/// char and leaves a small fragment in the line — cosmetic; the old
+/// \d grammar stripped the token whole but re-opened that leak.
+static TRIM_BODY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r"[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}[ T][0-9]{{2}}:[0-9]{{2}}(?::[0-9]{{2}}(?:{FRAC})?)?(?:Z|[+-][0-9]{{2}}:?[0-9]{{2}})?"
+    )
+});
+
 /// Anchor wrapper so the EOD residual check reuses FRAC verbatim
-/// (is_match of "^" + FRAC + "$") instead of a second hand copy.
+/// instead of a second hand copy.
 static FRAC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("^{FRAC}$")).unwrap());
 
 fn is_full_iso(s: &str) -> bool {
@@ -277,12 +295,13 @@ fn to_canonical(s: &str, out: &mut String) {
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
         // Residual = tail after the "…T24:00(:00)" head: empty for the
-        // minute-precision form ("T24:00", len 16). get() instead of a
-        // slice keeps that case panic-free without bounds bookkeeping —
-        // FULL_ISO_RE is [0-9]-pinned, so the tail is ascii and the
-        // checks below cannot panic (no multibyte net needed).
-        // split_off cuts the tail off in place: the None branch discards
-        // it and the Some branch re-pushes it verbatim, so no copy.
+        // minute-precision form ("T24:00", len 16). split_off cuts the
+        // tail off in place — the None branch discards it, the Some
+        // branch re-pushes it verbatim — so the only bounds check is
+        // this len > 19 (the len-16 form panicked as a raw slice OOB
+        // in r21; the guard is that path's net). FULL_ISO_RE is
+        // [0-9]-pinned, so the tail is ascii and the check cannot
+        // panic (no multibyte net needed).
         let residual = if out.len() > 19 { out.split_off(19) } else { String::new() };
         // Only empty or frac tails are real grammar here. ponytail:
         // drift net — the None clamp branch below DISCARDS the residual
@@ -904,17 +923,10 @@ fn main() {
 
     // Compile ALL regexes BEFORE spawning gcloud: a bad pattern must not
     // orphan a running child process.
+    let default_ts =
+        format!(r"(?:{})|(?:[0-9]{{2}}/[A-Za-z]{{3}}/[0-9]{{4}}:[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}})", *TRIM_BODY);
     let re_timestamp = compile_regex(
-        config.timestamp_regex.as_deref().unwrap_or(
-            // ponytail: offsets matched so trimming strips them fully; the
-            // lexicographic compare stays tz-naive — chrono if that matters.
-            // [0-9] over \d (same as FULL_ISO_RE): \d is Unicode-aware, so
-            // a timestamp with a fullwidth digit would match here (stripped
-            // by trim) yet fail is_full_iso — the line leaks past the
-            // range filter with its timestamp deleted. Un-pinning this
-            // grammar re-opens that verified leak.
-            r"([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)|([0-9]{2}/\w{3}/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2})"
-        ),
+        config.timestamp_regex.as_deref().unwrap_or(&default_ts),
         "config timestamp_regex",
     );
     let re_boilerplate = compile_regex(

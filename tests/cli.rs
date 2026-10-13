@@ -496,6 +496,17 @@ fn minute_precision_eod_bound_clamps_to_next_day() {
 }
 
 #[test]
+fn minute_precision_line_enters_range_filter() {
+    // verified leak (r24): trim required seconds, so a valid minute-
+    // precision ts never reached is_full_iso and the line past --since
+    // printed unchecked; the default trim grammar now matches it
+    let path = fixture("2026-10-01T05:00 early thing\n2026-10-13T05:00 late thing\n");
+    let p = path.0.to_string_lossy().into_owned();
+    let out = cardio(&["--since", "2026-10-09", &p]);
+    assert!(out.contains("late") && !out.contains("early"), "got: {out:?}");
+}
+
+#[test]
 fn frac_on_minutes_bound_is_rejected() {
     // a frac on minutes is no real grammar — rejected like any invalid ts
     let path = fixture("2026-10-09T12:34:30 event\n");
