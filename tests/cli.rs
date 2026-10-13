@@ -450,7 +450,7 @@ fn impossible_date_bound_is_rejected() {
 fn out_of_range_time_bound_is_rejected() {
     // hour/minute sanity: T99:99:99 would mis-order locally and be
     // unembeddable server-side — fail fast like a bad date
-    for b in ["2026-10-09T99:99:99", "2026-10-09T12:99:00"] {
+    for b in ["2026-10-09T99:99:99", "2026-10-09T12:99:00", "2026-10-09T24:00.5"] {
         let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
             .args(["--since", b])
             .output()

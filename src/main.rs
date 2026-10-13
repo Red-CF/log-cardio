@@ -127,14 +127,19 @@ fn is_full_iso(s: &str) -> bool {
         }
         if h == 24 && !is_eod_24(b) {
             // the shape rule lives in is_eod_24 — to_canonical's rewrite
-            // accepts exactly what passes here (no second copy)
+            // accepts exactly what passes here (no second copy). What a
+            // rejected 24:xx / :60 LINE means downstream: no valid lead ts
+            // in the line -> it BYPASSES the range filter with the usual
+            // one-shot "non-ISO" warning (so a bad-hour line can leak past
+            // bounds; bounds themselves fail fast above).
             return false;
         }
         let mi = ((b[14] - b'0') as u32) * 10 + (b[15] - b'0') as u32;
         if h <= 23 && !(0..=59).contains(&mi) {
             return false;
         }
-        if b.len() >= 19 && b[16] == b':' {
+        if h <= 23 && b.len() >= 19 && b[16] == b':' {
+            // h == 24 needs nothing here: is_eod_24 already forced "00"
             let sec = ((b[17] - b'0') as u32) * 10 + (b[18] - b'0') as u32;
             if sec > 59 {
                 return false;
@@ -212,10 +217,13 @@ fn strip_tz(out: &mut String) {
 /// ISO 8601 end-of-day "T24:00(:00…0)" — valid only with zero minutes (and
 /// zero seconds when present). THE one home of the rule: is_full_iso
 /// validates through it, to_canonical rewrites exactly what it accepts —
-/// the two can't drift.
+/// the two can't drift. Frac on MINUTES (b[16] == '.') is not accepted —
+/// that grammar is rejected wholesale (its canonical rewrite would drop
+/// the frac silently).
 fn is_eod_24(b: &[u8]) -> bool {
     b[11] == b'2' && b[12] == b'4' && b[13] == b':'
         && b[14] == b'0' && b[15] == b'0'
+        && b.get(16) != Some(&b'.')
         && (b.len() < 19 || b[16] != b':' || (b[17] == b'0' && b[18] == b'0'))
 }
 
@@ -532,21 +540,31 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
     (stdout, child)
 }
 
+/// Canonical-shape gate shared by BOTH gcloud pushdown embedders
+/// (server_ts, until_server_bound): the canonical string is a full
+/// datetime with a MAX_FRAC-padded frac. Drift means a silently wrong or
+/// garbage gcloud literal — panic loud, naming the string.
+fn assert_canonical_shape(canonical: &str) {
+    let b = canonical.as_bytes();
+    let ok = b.len() == 19 + 1 + MAX_FRAC
+        && b.get(10) == Some(&b'T')
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'.';
+    assert!(ok, "canonical shape drift: {canonical:?}");
+}
+
 /// Server-pushdown literal for an --until bound: `<` one second past the
 /// bound's floor second. (`<=` the floor second would EXCLUDE (floor, frac)
 /// entries the local filter keeps — a plain "…45" literal is instant 45.0,
 /// not the whole second.) None only when no next second exists (9999) —
 /// the caller drops the clause; the local exact filter still bounds it.
-/// The canonical shape is a to_canonical invariant: a drifting input
-/// panics (loud) instead of silently widening the fetch.
 fn until_server_bound(canonical: &str) -> Option<String> {
-    assert!(
-        canonical.find('.').is_some() && canonical.len() > 19,
-        "canonical shape drift: {canonical:?}"
-    );
-    // rollover (next-day) is the rare path — the date is borrowed unless
-    // the hour roll needs an owned next-day string
-    let mut date: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(&canonical[..10]);
+    assert_canonical_shape(canonical);
+    // ponytail: plain String — called once per run (bounds canonicalize
+    // once), a Cow's borrowed/owned split costs more than the 10-byte
+    // alloc it saves; only the rare h==24 rollover needs an owned date
+    let mut date = canonical[..10].to_string();
     let mut h: u32 = canonical[11..13].parse().expect("canonical hour");
     let mut m: u32 = canonical[14..16].parse().expect("canonical minute");
     let mut s: u32 = canonical[17..19].parse().expect("canonical second");
@@ -555,22 +573,19 @@ fn until_server_bound(canonical: &str) -> Option<String> {
     if m == 60 { m = 0; h += 1; }
     if h == 24 {
         h = 0;
-        date = std::borrow::Cow::Owned(next_day(&date)?);
+        date = next_day(&date)?;
     }
     Some(format!("{date}T{h:02}:{m:02}:{s:02}"))
 }
 
 /// since-pushdown literal: the bound's floor second — entries from it on
 /// are fetched, sub-second extras before the exact local filter's cut are
-/// dropped locally. Canonical shape is a to_canonical invariant (padded
-/// frac, full date/time) — same drift class until_server_bound asserts on.
+/// dropped locally.
 /// ponytail: second-precision pushdown, no frac at all — GCP parser risk
 /// gone; finer narrowing if the fetch ever needs it.
 fn server_ts(canonical: &str) -> &str {
-    let i = canonical
-        .find('.')
-        .expect("canonical shape drift: no frac pad");
-    &canonical[..i]
+    assert_canonical_shape(canonical);
+    &canonical[..19]
 }
 
 /// Spawn gcloud / bq / open file / stdin. Returns the input source and any
