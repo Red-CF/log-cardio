@@ -125,17 +125,10 @@ fn is_full_iso(s: &str) -> bool {
         if h > 24 {
             return false;
         }
-        if h == 24 {
-            // ISO 8601 allows exactly 24:00(:00) as end-of-day; anything
-            // else past 23 is bogus. Leap seconds (…:60) are rejected: the
-            // line bypasses the range filter with the usual one-shot
-            // warning — ponytail ceiling, a leap table is out of scope.
-            if b[14] != b'0' || b[15] != b'0' {
-                return false;
-            }
-            if b.len() >= 19 && b[16] == b':' && (b[17] != b'0' || b[18] != b'0') {
-                return false;
-            }
+        if h == 24 && !is_eod_24(b) {
+            // the shape rule lives in is_eod_24 — to_canonical's rewrite
+            // accepts exactly what passes here (no second copy)
+            return false;
         }
         let mi = ((b[14] - b'0') as u32) * 10 + (b[15] - b'0') as u32;
         if h <= 23 && !(0..=59).contains(&mi) {
@@ -187,6 +180,9 @@ fn flush(outbuf: &mut Sink) {
 const MAX_FRAC: usize = 19;
 const ZEROS: &str = "0000000000000000000"; // MAX_FRAC zeros
 const NINES: &str = "9999999999999999999"; // MAX_FRAC nines (max_instant)
+// both pads are MAX_FRAC-wide by construction — checked at compile time so
+// a MAX_FRAC change can't leave a stranded const behind
+const _: () = assert!(ZEROS.len() == MAX_FRAC && NINES.len() == MAX_FRAC);
 
 /// tz-naive suffix strip (call AFTER space→'T'): trailing 'Z' or a
 /// ±dd(:?dd)? tail. Byte checks, not regex — every line passes here.
@@ -354,7 +350,8 @@ fn next_day(date: &str) -> Option<String> {
 /// instant. The frac is NINES, not zeros — an exclusive until at the last
 /// day must admit instants inside the final second (.5 >= a zeros-pad
 /// bound would drop them; pad ZEROS is to_canonical's shape by default).
-/// ponytail: derived through to_canonical so the shape has one source.
+/// ponytail: derived through to_canonical so the shape has one source; the
+/// NINES const is compile-time-checked against MAX_FRAC.
 fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out);
     match out.find('.') {
@@ -547,7 +544,9 @@ fn until_server_bound(canonical: &str) -> Option<String> {
         canonical.find('.').is_some() && canonical.len() > 19,
         "canonical shape drift: {canonical:?}"
     );
-    let mut date = canonical[..10].to_string();
+    // rollover (next-day) is the rare path — the date is borrowed unless
+    // the hour roll needs an owned next-day string
+    let mut date: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(&canonical[..10]);
     let mut h: u32 = canonical[11..13].parse().expect("canonical hour");
     let mut m: u32 = canonical[14..16].parse().expect("canonical minute");
     let mut s: u32 = canonical[17..19].parse().expect("canonical second");
@@ -556,21 +555,22 @@ fn until_server_bound(canonical: &str) -> Option<String> {
     if m == 60 { m = 0; h += 1; }
     if h == 24 {
         h = 0;
-        date = next_day(&date)?;
+        date = std::borrow::Cow::Owned(next_day(&date)?);
     }
     Some(format!("{date}T{h:02}:{m:02}:{s:02}"))
 }
 
 /// since-pushdown literal: the bound's floor second — entries from it on
 /// are fetched, sub-second extras before the exact local filter's cut are
-/// dropped locally.
+/// dropped locally. Canonical shape is a to_canonical invariant (padded
+/// frac, full date/time) — same drift class until_server_bound asserts on.
 /// ponytail: second-precision pushdown, no frac at all — GCP parser risk
 /// gone; finer narrowing if the fetch ever needs it.
 fn server_ts(canonical: &str) -> &str {
-    match canonical.find('.') {
-        Some(i) => &canonical[..i],
-        None => canonical,
-    }
+    let i = canonical
+        .find('.')
+        .expect("canonical shape drift: no frac pad");
+    &canonical[..i]
 }
 
 /// Spawn gcloud / bq / open file / stdin. Returns the input source and any
