@@ -135,38 +135,50 @@ fn flush(outbuf: &mut Sink) {
 }
 
 /// Normalize a matched timestamp for lexicographic compare against the
-/// "T"-separated bounds: "YYYY-MM-DD HH:MM:SS" grows a 'T' (" " < "T" would
-/// mis-order), and a date-only match becomes that day's start (else it's a
-/// strict prefix and compares below every same-day bound).
+/// "T"-separated bounds: a date-only match becomes that day's start, a space
+/// separator converts to 'T' (" " < "T" would mis-order), and a
+/// minute-precision match grows ":00" so it never compares as a prefix.
 /// Result is written into `buf` (reused per iteration) and returned as &str.
 fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
     if ts.len() == 10 {
         buf.clear();
         buf.push_str(ts);
         buf.push_str("T00:00:00");
-        buf.as_str()
-    } else if ts.len() > 10 && ts.as_bytes()[10] == b' ' {
+        return buf.as_str();
+    }
+    if ts.as_bytes()[10] == b' ' {
         buf.clear();
         buf.push_str(&ts[..10]);
         buf.push('T');
         buf.push_str(&ts[11..]);
-        buf.as_str()
     } else {
-        ts
+        buf.clear();
+        buf.push_str(ts);
     }
+    if buf.len() == 16 {
+        buf.push_str(":00");
+    }
+    buf.as_str()
 }
 
-/// Canonicalize a validated --since bound: date-only grows a day-start time.
+/// Canonicalize a validated --since bound: date-only grows a day-start time,
+/// minute-precision grows ":00" (never compare as a bare prefix).
 /// ponytail: bounds normalized at this layer so callers can't forget the
 /// convention; offset handling stays tz-naive — chrono if that ever matters.
 fn canonical_since(s: &str) -> String {
-    if s.len() == 10 { format!("{}T00:00:00", s) } else { s.replacen(' ', "T", 1) }
+    if s.len() == 10 { format!("{}T00:00:00", s) }
+    else { pad_minute(&s.replacen(' ', "T", 1)) }
 }
 
 /// --until is <, so a date-only bound means NEXT-day start: "--until 2026-10-09"
 /// keeps all of the 9th instead of excluding the whole end day.
 fn canonical_until(s: &str) -> String {
-    if s.len() == 10 { next_day_start(s) } else { s.replacen(' ', "T", 1) }
+    if s.len() == 10 { next_day_start(s) }
+    else { pad_minute(&s.replacen(' ', "T", 1)) }
+}
+
+fn pad_minute(s: &str) -> String {
+    if s.len() == 16 { format!("{}:00", s) } else { s.to_string() }
 }
 
 /// One date increment, no chrono: manual month/leap arithmetic.
@@ -224,7 +236,7 @@ struct RunResult {
 /// embedded newlines/commas — raw --format=csv lines would corrupt them.
 enum Source {
     Lines(Box<dyn BufRead>),
-    Rows(csv::Reader<BufReader<ChildStdout>>),
+    Rows(csv::Reader<ChildStdout>),
 }
 
 /// Shared per-line pipeline: read bytes → query reject → time range → trim.
@@ -280,15 +292,19 @@ impl Pipeline {
                             if i > 0 { line.push(' '); }
                             line.push_str(&String::from_utf8_lossy(f));
                         }
-                        // one-line-per-event contract for the join too
-                        if line.contains('\n') {
+                        // flatten to one line: quoted fields with line breaks
+                        // must not tear the one-event contract (CRLF → one
+                        // space, not two: drop the CR first)
+                        if line.contains(['\n', '\r']) {
+                            line = line.replace('\r', "");
                             line = line.replace('\n', " ");
                         }
                         std::borrow::Cow::Owned(line)
                     }
-                    // header row (row 1) is skipped by the csv reader.
                     None => return None,
                     Some(Err(e)) => {
+                        // count the failed record so the warning locates it
+                        self.line_no += 1;
                         self.read_error = Some(e.into());
                         return None;
                     }
@@ -397,11 +413,9 @@ fn make_reader(
             sql.clone(),
         ];
         let (stdout, child) = spawn_fetcher("bq", bq_args);
-        let rows = csv::ReaderBuilder::new()
-            // ponytail: a ragged row is tolerated (read_error stays silent
-            // for it only if it parses; flexible avoids aborting the run)
-            .flexible(true)
-            .from_reader(BufReader::new(stdout));
+        // ponytail: csv::Reader buffers internally — no BufReader here.
+        // flexible(true) tolerates a ragged record instead of aborting.
+        let rows = csv::ReaderBuilder::new().flexible(true).from_reader(stdout);
         (Source::Rows(rows), Some(("bq", child)))
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {

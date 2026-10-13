@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -231,7 +233,9 @@ fn bq_csv_rows_are_clean_events() {
     let script = fake.join("bq");
     std::fs::write(&script, "#!/bin/sh\ncat <<'CSV'\ntimestamp,text\n2026-10-13T12:00:00Z,\"req_1 login, ok\"\n2026-10-13T12:00:02Z,\nCSV\n")
         .expect("write fake bq");
-    let _ = Command::new("chmod").arg("+x").arg(&script).status();
+    #[cfg(unix)]
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake bq executable");
 
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .args(["--bq", "SELECT timestamp, text FROM t", "--json"])
@@ -253,6 +257,58 @@ fn bq_csv_rows_are_clean_events() {
     let v: serde_json::Value = serde_json::from_str(lines[0])
         .unwrap_or_else(|e| panic!("line must be JSON: {e}"));
     assert_eq!(v["content"], "req_1 login, ok", "no separator residue: {stdout:?}");
+    std::fs::remove_dir_all(&fake).ok();
+}
+
+#[test]
+fn bq_crlf_text_field_flattens_to_one_line() {
+    // quoted field with CRLF breaks: the event must stay one line
+    let fake = std::env::temp_dir()
+        .join(format!("cardio_fakebin_{}_crlf", std::process::id()));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join("bq");
+    std::fs::write(&script, "#!/bin/sh\nprintf 'timestamp,text\\n\"line1\\r\\nline2 more\",x\\n'\n")
+        .expect("write fake bq");
+    #[cfg(unix)]
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake bq executable");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT 1"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    assert!(
+        out.status.success(),
+        "cardio exited {}: stderr: {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "CRLF field must flatten to one event: {stdout:?}");
+    assert_eq!(lines[0], "line1 line2 more x", "no CR residue: {stdout:?}");
+}
+
+#[test]
+fn minute_precision_ts_pads_to_seconds() {
+    // minute-precision line ts must pad to ":00": unpadded it sorts as a bare
+    // prefix strictly below its own minute's second-precision bounds
+    // (fixable half: since >= at the exact minute, until < from it — the
+    // second-precision --since ABOVE the minute is unknowable from the text)
+    let cfg = fixture("timestamp_regex = '\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}'\n");
+    let path = fixture("2026-10-09 12:00 event\n2026-10-09 11:00 old\n");
+    let cfgarg = cfg.0.to_string_lossy().to_string();
+    let patharg = path.0.to_string_lossy().to_string();
+
+    let kept = cardio(&["--config", &cfgarg, "--since", "2026-10-09T12:00:00", &patharg]);
+    assert!(kept.contains("event"), "12:00 (= 12:00:00) must pass --since, got: {kept:?}");
+    assert!(!kept.contains("old"), "got: {kept:?}");
+
+    let dropped = cardio(&["--config", &cfgarg, "--until", "2026-10-09T12:00:00", &patharg]);
+    assert!(!dropped.contains("event"), "exclusive --until drops the exact minute, got: {dropped:?}");
+    assert!(dropped.contains("old"), "11:00 stays behind the bound, got: {dropped:?}");
 }
 
 #[test]
