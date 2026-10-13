@@ -292,6 +292,46 @@ fn bq_crlf_text_field_flattens_to_one_line() {
 }
 
 #[test]
+fn short_ts_regex_does_not_panic() {
+    // regression: a user regex matching <10 chars reached byte[10] and
+    // aborted with index-out-of-bounds
+    let cfg = fixture("timestamp_regex = '\\d{6}'\n");
+    let path = fixture("202610 event\n");
+    let out = cardio(&[
+        "--config", cfg.0.to_string_lossy().as_ref(),
+        path.0.to_string_lossy().as_ref(),
+    ]);
+
+    assert!(out.contains("event"), "short ts must pass through, got: {out:?}");
+}
+
+#[test]
+fn bq_lone_cr_content_is_preserved() {
+    // CR flattening must only eat CRLF pairs, never a lone CR's content
+    let fake = std::env::temp_dir()
+        .join(format!("cardio_fakebin_{}_cr", std::process::id()));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join("bq");
+    std::fs::write(&script, "#!/bin/sh\nprintf 'timestamp,text\\n\"code:\\r17\",x\\n'\n")
+        .expect("write fake bq");
+    #[cfg(unix)]
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake bq executable");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT 1"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    assert!(out.status.success(), "cardio exited {}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "lone CR is inside one event: {stdout:?}");
+    assert_eq!(lines[0], "code:\r17 x", "no content byte destroyed: {stdout:?}");
+}
+
+#[test]
 fn minute_precision_ts_pads_to_seconds() {
     // minute-precision line ts must pad to ":00": unpadded it sorts as a bare
     // prefix strictly below its own minute's second-precision bounds

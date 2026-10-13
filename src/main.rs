@@ -134,51 +134,71 @@ fn flush(outbuf: &mut Sink) {
     }
 }
 
+/// Padding for partial-precision ISO matches: date-only = day start,
+/// hour = ":00:00", minute = ":00" — full precision never left un-padded,
+/// so a partial ts never compares as a bare prefix below its own instant.
+/// Single invariant used by both the line side and the bounds side.
+fn partial_pad(ts_len: usize) -> Option<&'static str> {
+    match ts_len {
+        10 => Some("T00:00:00"),
+        13 => Some(":00:00"),
+        16 => Some(":00"),
+        _ => None,
+    }
+}
+
+fn pad_partial(s: &str) -> String {
+    match partial_pad(s.len()) {
+        Some(p) => format!("{}{}", s, p),
+        None => s.to_string(),
+    }
+}
+
 /// Normalize a matched timestamp for lexicographic compare against the
-/// "T"-separated bounds: a date-only match becomes that day's start, a space
-/// separator converts to 'T' (" " < "T" would mis-order), and a
-/// minute-precision match grows ":00" so it never compares as a prefix.
+/// "T"-separated bounds: a space separator converts to 'T' (" " < "T" would
+/// mis-order) and partial precision gets padded (partial_pad). ts shorter
+/// than a full date is returned untouched (a user regex can match shorter).
 /// Result is written into `buf` (reused per iteration) and returned as &str.
 fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
-    if ts.len() == 10 {
-        buf.clear();
-        buf.push_str(ts);
-        buf.push_str("T00:00:00");
-        return buf.as_str();
+    if ts.len() < 10 {
+        // crash guard: a user regex can match shorter than a full date
+        return ts;
     }
-    if ts.as_bytes()[10] == b' ' {
+    let has_space = ts.len() > 10 && ts.as_bytes()[10] == b' ';
+    let pads = partial_pad(ts.len());
+    if has_space || pads.is_some() {
         buf.clear();
-        buf.push_str(&ts[..10]);
-        buf.push('T');
-        buf.push_str(&ts[11..]);
+        if has_space {
+            buf.push_str(&ts[..10]);
+            buf.push('T');
+            buf.push_str(&ts[11..]);
+        } else {
+            buf.push_str(ts);
+        }
+        if let Some(p) = pads {
+            buf.push_str(p);
+        }
+        buf.as_str()
     } else {
-        buf.clear();
-        buf.push_str(ts);
+        // unchanged: keep the borrowed slice, no copy on the hot path
+        ts
     }
-    if buf.len() == 16 {
-        buf.push_str(":00");
-    }
-    buf.as_str()
 }
 
-/// Canonicalize a validated --since bound: date-only grows a day-start time,
-/// minute-precision grows ":00" (never compare as a bare prefix).
-/// ponytail: bounds normalized at this layer so callers can't forget the
-/// convention; offset handling stays tz-naive — chrono if that ever matters.
+/// Canonicalize bounds via the shared partial_pad rule (date-only = day
+/// start; minute/hour precision = pad). ponytail: bounds normalized at this
+/// layer so callers can't forget the convention; offset handling stays
+/// tz-naive — chrono if that ever matters.
 fn canonical_since(s: &str) -> String {
-    if s.len() == 10 { format!("{}T00:00:00", s) }
-    else { pad_minute(&s.replacen(' ', "T", 1)) }
+    pad_partial(&s.replacen(' ', "T", 1))
 }
 
-/// --until is <, so a date-only bound means NEXT-day start: "--until 2026-10-09"
-/// keeps all of the 9th instead of excluding the whole end day.
+/// --until is <, so a DATE-ONLY bound means NEXT-day start: "--until 2026-10-09"
+/// keeps all of the 9th instead of excluding the whole end day. Padded
+/// precisions keep their instant (exclusive at the pad instant).
 fn canonical_until(s: &str) -> String {
-    if s.len() == 10 { next_day_start(s) }
-    else { pad_minute(&s.replacen(' ', "T", 1)) }
-}
-
-fn pad_minute(s: &str) -> String {
-    if s.len() == 16 { format!("{}:00", s) } else { s.to_string() }
+    let t = s.replacen(' ', "T", 1);
+    if t.len() == 10 { next_day_start(&t) } else { pad_partial(&t) }
 }
 
 /// One date increment, no chrono: manual month/leap arithmetic.
@@ -292,11 +312,11 @@ impl Pipeline {
                             if i > 0 { line.push(' '); }
                             line.push_str(&String::from_utf8_lossy(f));
                         }
-                        // flatten to one line: quoted fields with line breaks
-                        // must not tear the one-event contract (CRLF → one
-                        // space, not two: drop the CR first)
+                        // flatten to one line: a quoted field's CRLF pair
+                        // collapses to one space; a LONE carriage return is
+                        // content and stays verbatim
                         if line.contains(['\n', '\r']) {
-                            line = line.replace('\r', "");
+                            line = line.replace("\r\n", " ");
                             line = line.replace('\n', " ");
                         }
                         std::borrow::Cow::Owned(line)
