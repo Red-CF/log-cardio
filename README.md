@@ -8,6 +8,12 @@ themselves (`--gcloud`, `--bq`) and get context with `cardio --agent-md`.
 ## Install
 
 ```bash
+cargo install log-cardio   # installs the `cardio` binary
+```
+
+Or from source:
+
+```bash
 cargo install --path .
 ```
 
