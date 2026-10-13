@@ -11,23 +11,23 @@ itself (`--gcloud`, `--bq`) — the log never touches disk.
 ## You are an agent: run this
 
 ```bash
-cardio --lean app.log              # file
-tail -f app.log | cardio --lean    # stream
-cardio --lean --gcloud 'resource.type=gce_instance'
-cardio --lean --bq 'SELECT text AS log FROM prod.traces'
+cardio app.log              # file — lean by default
+tail -f app.log | cardio    # stream
+cardio --gcloud 'resource.type=gce_instance'
+cardio --bq 'SELECT text AS log FROM prod.traces'
 ```
 
-**--lean** trims timestamps + boilerplate tokens, drops repeated whole
-lines, and caps output at 2000 lines (override the cap with `--max-lines
-N` if you need more). Start there; add flags only when the question
-demands it.
+**Default pipeline is lean**: trim + boilerplate stripped + dedup on +
+output capped at 2000 lines (`--max-lines N` overrides). No flags needed —
+this is the mode that keeps your context spend low.
 
-## Flags (on top of lean)
+## Flags
 
 | Flag | Effect |
 |---|---|
+| `--raw` | skip the agent pipeline: no dedup, no cap (only trim still applies) |
 | `--query error` | keep only lines containing TEXT (substring) |
-| `--max-lines N` | cap output lines (in lean already 2000) |
+| `--max-lines N` | cap output lines (raw mode: only when you pass it) |
 | `--json` | NDJSON output: {"index","content"} |
 | `--since TS` / `--until TS` | keep lines with timestamp >= TS / < TS |
 | `--trace REGEX` | group lines by captured ID (e.g. request_id=...), sessions at end |
@@ -38,15 +38,13 @@ demands it.
 | `--bq "SQL"` | stream BigQuery rows via the bq CLI (CSV) |
 | `--config FILE` | custom timestamp/boilerplate regexes, default_trace (TOML) |
 
-Without `--lean` you get the raw pipeline (no dedup, no cap) — use it when
-you must not lose a single line.
-
-**⚠ Dedup drops unique lines (~1% false positives).** The Bloom filter
-cannot tell a repeated line from a hash collision, so roughly 1 in 100
-unique lines is discarded as if it were a duplicate. That is a correct
-trade for trimming noise, and data loss when you're hunting one weird
-event. Never `--lean`/`--dedup` over a log where any line might be THE
-answer — run without them (or with `--query` narrowed) instead.
+**⚠ Default mode drops lines.** Two ways, both deliberate: duplicated
+whole lines are removed (Bloom filter, **~1% false positives — a UNIQUE
+line can be discarded as if repeated**), and output stops at 2000 lines.
+Correct trade for trimming noise, data loss when you're hunting one
+weird event. When any line might be THE answer: `--raw` (nothing
+dropped, nothing capped), or narrow with `--query` to read everything
+you kept.
 
 ## Output shape
 Default: one line per kept event, boilerplate trimmed away.

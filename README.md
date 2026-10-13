@@ -14,16 +14,18 @@ cargo install --path .
 ## Input
 
 ```bash
-cardio --lean app.log                       # file — the agent mode
-cardio --lean --gcloud 'resource.type=gce_instance'
-cardio --lean --bq 'SELECT FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp, text FROM prod.traces'
-cardio app.log                              # raw pipeline, no dedup/cap
+cardio app.log                              # file — lean by default (trim + dedup + cap 2000)
+cardio --gcloud 'resource.type=gce_instance'
+cardio --bq 'SELECT FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp, text FROM prod.traces'
+cardio --raw app.log                        # fidelity: no dedup, no cap
 ```
 
-> **⚠ `--lean`/`--dedup` drop unique lines (~1% false positives).** The
-> Bloom filter can't tell a repeat from a hash collision — the cheapest
-> 1% is noise, but if the line you need might be THE answer, run without
-> them. Cap default under `--lean` is 2000 lines (`--max-lines` overrides).
+> **⚠ The default pipeline drops lines.** Whole repeated lines are
+> removed (Bloom filter — **~1% false positives: a unique line can be
+> discarded as if repeated**) and output stops at 2000 lines
+> (`--max-lines` overrides). It's the right trade for trimming noise;
+> when any line might be THE answer, run `--raw` or narrow with
+> `--query`.
 
 gcloud mode pushes `--since`/`--until` bounds into the server-side filter
 (timestamp clauses), so it downloads only the window you asked for. Without
@@ -56,7 +58,7 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | Flag | Effect |
 |---|---|
 | `[file]` | Log file. Omitted → stdin. |
-| `--lean` | Agent mode: trim + `--dedup` + `--max-lines 2000` in one command. |
+| `--raw` | Skip the default agent pipeline: no dedup, no line cap. |
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
 | `--dedup` | Drop repeated whole lines (Bloom filter — **~1% false positives, and they're unique lines thrown away**). |

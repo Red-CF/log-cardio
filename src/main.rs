@@ -73,10 +73,10 @@ struct Args {
     #[arg(long)]
     config: Option<String>,
 
-    /// Agent mode: --dedup on + --max-lines 2000 unless you pass your own
-    /// --max-lines. THE way agents read logs; drop it for raw fidelity.
+    /// Skip the default agent pipeline: no dedup, no 2000-line cap.
+    /// Use when every line must survive (hunting one weird event).
     #[arg(long)]
-    lean: bool,
+    raw: bool,
 
     /// Print an agent-facing markdown card (what cardio is, flags, output,
     /// time gotchas) and exit — pipe it: `cardio --agent-md > AGENTS.md`
@@ -892,12 +892,14 @@ fn main() {
         exit(0);
     }
 
-    // --lean: compose the agent defaults. Mutating args here instead of
-    // sprinkling `|| args.lean` at every site keeps the runners untouched:
-    // dedup on, --max-lines defaulting to LEAN_MAX_LINES unless given.
+    // Lean is the default pipeline: unless --raw, dedup on and the cap
+    // defaults to LEAN_MAX_LINES (an explicit --max-lines wins --raw
+    // notwithstanding: asking for a cap is asking for a cap). Mutating
+    // args keeps the runners untouched; a local dedup so the trace-mode
+    // warning only fires when --dedup was explicitly passed.
     let mut args = args;
-    if args.lean {
-        args.dedup = true;
+    let dedup = args.dedup || !args.raw;
+    if !args.raw {
         args.max_lines = args.max_lines.or(Some(LEAN_MAX_LINES));
     }
 
@@ -1013,7 +1015,7 @@ fn main() {
     };
 
     // --stats/--trace never stream per line, so bloom only exists in stream mode
-    let mut bloom = if matches!(run, Run::Stream) && args.dedup {
+    let mut bloom = if matches!(run, Run::Stream) && dedup {
         Some(Bloom::new_for_fp_rate(10_000_000, 0.01).expect("Failed to init bloom filter"))
     } else {
         None

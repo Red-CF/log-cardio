@@ -517,15 +517,16 @@ fn agent_md_prints_card() {
     assert!(out.status.success(), "got: {:?}", out.status);
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
-        s.contains("--lean") && s.contains("unique lines") && s.contains("--since"),
+        s.contains("lean by default") && s.contains("UNIQUE") && s.contains("--raw") && s.contains("--since"),
         "got: {s:?}"
     );
 }
 
 #[test]
-fn lean_composes_dedup_and_default_cap() {
-    // --lean = dedup on + --max-lines 2000 (overridable); repeats must
-    // collapse and the cap must apply without an explicit --max-lines
+fn default_pipeline_dedups_and_caps_raw_skips_it() {
+    // lean is the default: dedup on + --max-lines 2000 (overridable);
+    // --raw = no dedup, no cap. Repeats must collapse and the cap must
+    // apply without any flag
     let mut content = String::new();
     content.push_str("2026-10-09T12:00:00 repeated start\n");
     for i in 0..2100 {
@@ -535,16 +536,19 @@ fn lean_composes_dedup_and_default_cap() {
     let path = fixture(&content);
     let p = path.0.to_string_lossy().into_owned();
 
-    let out = cardio(&["--lean", &p]);
+    let out = cardio(&[&p]);
     // the two "repeated start" lines collapse to the first (dedup)
     let count = out.matches("repeated start").count();
     assert_eq!(count, 1, "dedup should keep one, got {count}");
-    // cap: 2000 output lines = "repeated start" + unique-0000..1998;
-    // unique-1999 onward never printed
+    // cap: 2000 output lines, unique-1999 onward never printed
     assert!(out.contains("unique-1998") && !out.contains("unique-1999"), "cap 2000 missed");
-    // explicit --max-lines overrides the lean default
-    let capped = cardio(&["--lean", "--max-lines", "5", &p]);
+    // explicit --max-lines overrides the default cap
+    let capped = cardio(&["--max-lines", "5", &p]);
     assert!(capped.lines().count() <= 5, "got {}", capped.lines().count());
+    // --raw: no dedup, no cap — both repeats and every unique survive
+    let raw = cardio(&["--raw", &p]);
+    assert_eq!(raw.matches("repeated start").count(), 2, "--raw must keep repeats");
+    assert!(raw.contains("unique-2099"), "--raw must keep the tail");
 }
 
 #[test]
