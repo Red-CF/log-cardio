@@ -22,7 +22,8 @@ jobs:
         # this works offline everywhere
 
   build:
-    # release build is what users install — must stay clean on all OSes
+    # release build is what users install — must stay clean on all OSes;
+    # the binary also ships with the GitHub release (picked up by `release`)
     strategy:
       fail-fast: false
       matrix:
@@ -32,6 +33,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
+      - name: stage named binary
+        shell: bash
+        run: |
+          EXT=$([ "$RUNNER_OS" = "Windows" ] && echo .exe || echo "")
+          mv "target/release/cardio$EXT" "cardio-$RUNNER_OS-$RUNNER_ARCH$EXT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cardio-${{ runner.os }}
+          path: cardio-*
 
   coverage:
     # one OS is enough for coverage — it's a tooling report, not a contract
@@ -76,6 +86,8 @@ jobs:
     needs: [test, build, coverage]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -93,3 +105,13 @@ jobs:
           git tag "v$V"
           git push origin "v$V"
           gh release create "v$V" --generate-notes
+      - uses: actions/download-artifact@v4
+        with:
+          path: bins
+          merge-multiple: true
+      - name: attach native binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          gh release upload "v$V" bins/cardio-*
