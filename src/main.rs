@@ -40,6 +40,11 @@ struct Args {
     #[arg(long)]
     trace: Option<String>,
 
+    /// Compact per-ID map (event count + first/last event, IDs preserved)
+    /// instead of full sessions; needs --trace or config default_trace
+    #[arg(long)]
+    summary: bool,
+
     /// Survey mode: frequency summary of the whole file to stderr, no stream output
     #[arg(long)]
     stats: bool,
@@ -47,11 +52,6 @@ struct Args {
     /// GCloud Logging filter (e.g. "resource.type=gce_instance")
     #[arg(long)]
     gcloud: Option<String>,
-
-    /// GCloud freshness window (e.g. "7d"). Forces DESC order and cannot
-    /// combine with --since/--until (gcloud restriction).
-    #[arg(long)]
-    freshness: Option<String>,
 
     /// Path to TOML config file (timestamp_regex, boilerplate_regex, default_trace)
     #[arg(long)]
@@ -216,12 +216,17 @@ fn main() {
             compile_regex(p, source)
         });
     let trace_mode = trace_re.is_some();
+    let summary_mode = args.summary && trace_mode;
+    if args.summary && !trace_mode && !args.stats {
+        eprintln!("Error: --summary needs an ID pattern (--trace or config default_trace).");
+        exit(1);
+    }
 
     if args.dedup && trace_mode {
         eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
     }
     if args.stats && trace_mode {
-        eprintln!("Note: --stats is survey mode; --trace ignored.");
+        eprintln!("Note: --stats is survey mode; --trace/--summary ignored.");
     }
 
     // Bounds are fixed for the whole run: validate + canonicalize once, not
@@ -247,27 +252,13 @@ fn main() {
         if let Some(u) = &until_valid {
             gc_filter.push_str(&format!(" AND timestamp<\"{}\"", u));
         }
-        let mut gc_args = vec![
+        let gc_args = vec![
             "logging".to_string(), "read".to_string(), gc_filter,
             "--format".into(), "value(timestamp,textPayload,jsonPayload.message)".into(),
+            "--order=asc".into(),
         ];
-        // gcloud: --freshness works only with DESC ordering and filters
-        // WITHOUT a timestamp clause — exclusive with --order=asc and with
-        // pushed --since/--until. ponytail: no --limit pushdown for
-        // --max-lines; the early-cut kill already bounds the download.
-        let bounds = range_filter;
-        if bounds {
-            if args.freshness.is_some() {
-                eprintln!("Note: --freshness ignored — --since/--until already bound the query.");
-            }
-            gc_args.push("--order=asc".into());
-        } else if let Some(f) = &args.freshness {
-            // freshness forces DESC: stream arrives newest-first
-            gc_args.push("--freshness".into());
-            gc_args.push(f.clone());
-        } else {
-            gc_args.push("--order=asc".into());
-        }
+        // ponytail: no --limit pushdown for --max-lines; the early-cut kill
+        // already bounds the download.
         let mut child = Command::new("gcloud")
             .args(&gc_args)
             .stdout(Stdio::piped())
@@ -292,6 +283,8 @@ fn main() {
 
     // BTreeMap = stable, reproducible session order across runs
     let mut trace_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // summary mode: (event count, first, last) — IDs always preserved
+    let mut summary_map: BTreeMap<String, (usize, String, String)> = BTreeMap::new();
 
     let mut stats_map: HashMap<String, usize> = HashMap::new();
     const MAX_STATS_PATTERNS: usize = 100_000;
@@ -406,6 +399,27 @@ fn main() {
                     let id = caps.get(1)
                         .unwrap_or_else(|| caps.get(0).unwrap())
                         .as_str().to_string();
+                    if summary_mode {
+                        // summary keeps per-ID count + first/last event only
+                        let len_before = summary_map.len();
+                        match summary_map.entry(id) {
+                            btree_map::Entry::Occupied(mut e) => {
+                                let s = e.get_mut();
+                                s.0 += 1;
+                                s.2 = final_line.to_string();
+                                count += 1;
+                            }
+                            btree_map::Entry::Vacant(e) => {
+                                if len_before < MAX_TRACE_SESSIONS {
+                                    e.insert((1, final_line.to_string(), final_line.to_string()));
+                                    count += 1;
+                                } else {
+                                    sessions_capped = true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let len_before = trace_map.len();
                     match trace_map.entry(id) {
                         btree_map::Entry::Occupied(mut e) => {
@@ -511,7 +525,26 @@ fn main() {
         eprintln!("==============================");
     }
 
-    if trace_mode {
+    if summary_mode && !args.stats {
+        if args.json {
+            for (id, (count, first, last)) in &summary_map {
+                let json = serde_json::to_string(&serde_json::json!({
+                    "id": id, "count": count, "first": first, "last": last
+                })).unwrap();
+                emit(&mut outbuf, &json);
+            }
+        } else {
+            emit(&mut outbuf, &format!("\n=== TRACE SUMMARY: {} sessions ===", summary_map.len()));
+            for (id, (count, first, last)) in &summary_map {
+                // 1-event session: first == last — print once, singular label
+                let body = if *count == 1 { first.to_string() } else { format!("{}\n{}", first, last) };
+                emit(&mut outbuf, &format!(
+                    "--- [{}] {} event{} ---\n{}", id, count,
+                    if *count == 1 { "" } else { "s" }, body
+                ));
+            }
+        }
+    } else if trace_mode {
         for (id, lines) in trace_map {
             if args.json {
                 let json = serde_json::to_string(&serde_json::json!({"id": id, "events": lines}))
