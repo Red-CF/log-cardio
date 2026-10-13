@@ -189,6 +189,12 @@ const NINES: &str = "9999999999999999999"; // MAX_FRAC nines (max_instant)
 // a MAX_FRAC change can't leave a stranded const behind
 const _: () = assert!(ZEROS.len() == MAX_FRAC && NINES.len() == MAX_FRAC);
 
+/// All bytes numeric — the one digit predicate (strip_tz's time tails,
+/// the canonical shape gate via its loop).
+fn all_digits(b: &[u8]) -> bool {
+    b.iter().all(|c| c.is_ascii_digit())
+}
+
 /// tz-naive suffix strip (call AFTER space→'T'): trailing 'Z' or a
 /// ±dd(:?dd)? tail. Byte checks, not regex — every line passes here.
 /// The ':' check keeps the ± branch off plain instants (dates carry
@@ -204,25 +210,19 @@ fn strip_tz(out: &mut String) {
     }
     let b = out.as_bytes();
     let sign = |i: usize| b[i] == b'+' || b[i] == b'-';
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(|c| c.is_ascii_digit());
     let six = n - 6;
     let five = n - 5;
-    if sign(six) && digits(six + 1..n - 3) && b[n - 3] == b':' && digits(n - 2..n) {
+    if sign(six) && all_digits(&b[six + 1..n - 3]) && b[n - 3] == b':' && all_digits(&b[n - 2..]) {
         out.truncate(six); // ±dd:dd
-    } else if sign(five) && digits(five + 1..n) {
+    } else if sign(five) && all_digits(&b[five + 1..]) {
         out.truncate(five); // ±dddd
     }
 }
 
-/// ISO 8601 end-of-day "T24:00(:00…0)" — valid only with zero minutes (and
-/// zero seconds when present). THE one home of the rule: is_full_iso
-/// validates through it, to_canonical rewrites exactly what it accepts —
-/// the two can't drift. The '.'-check is belt-and-braces, not enforcement:
-/// frac-on-minutes is rejected WHOLESALE by FULL_ISO_RE (a frac may only
-/// follow seconds), so this condition is unreachable while that grammar
-/// holds — its job is keeping the predicate honest if the regex ever
-/// relaxes. The CLI-reachable guard is to_canonical's own minute_only
-/// assert.
+/// ISO 8601 end-of-day "T24:00(:00…0)": is_full_iso validates through it,
+/// to_canonical rewrites exactly what it accepts — the rule's one home.
+/// The '.'-check is insurance, not enforcement: frac-on-minutes is
+/// rejected wholesale by FULL_ISO_RE (pointer lives there).
 fn is_eod_24(b: &[u8]) -> bool {
     b[11] == b'2' && b[12] == b'4' && b[13] == b':'
         && b[14] == b'0' && b[15] == b'0'
@@ -235,7 +235,8 @@ fn is_eod_24(b: &[u8]) -> bool {
 /// or 'Z' tail itself would mis-order equal instants), date-only = day
 /// start, minute precision pads to ":00", and every instant ends with
 /// MAX_FRAC frac digits. Lines and bounds both land here — one
-/// invariant, no drift.
+/// invariant, no drift, asserted by assert_canonical_shape at BOTH exits
+/// (any drift anywhere in the pipeline panics loud, never mis-compares).
 fn to_canonical(s: &str, out: &mut String) {
     out.clear();
     if s.len() > 10 && s.as_bytes()[10] == b' ' {
@@ -246,27 +247,34 @@ fn to_canonical(s: &str, out: &mut String) {
         out.push_str(s);
     }
     strip_tz(out);
+    // FULL_ISO_RE forbids frac-on-minutes wholesale (a frac may only
+    // follow seconds) — the gate below makes any relaxation loud anyway.
     if out.len() == 10 {
         // date-only = day start (bounds: --until handles its own convention)
         out.push_str("T00:00:00");
         out.push('.');
         out.push_str(ZEROS);
+        assert_canonical_shape(out);
         return;
     }
     // ISO 8601 end-of-day "T24:00(:00)" = the NEXT day's 00:00:00 — left
     // alone, "…T24:…" would sort after everything yet before the next
-    // day's "T00:…" (compare order broken across the boundary). The shape
-    // rule lives in is_eod_24 (shared with is_full_iso); any residual frac
-    // tail is preserved and padded below.
+    // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
-        let residual = out[19.min(out.len())..].to_string();
+        // post-strip residual after "T24:00(:00)" is a frac tail or
+        // nothing — junk bytes (regex-relaxation drift) panic loud here
+        let tail = out[19.min(out.len())..].to_string();
+        assert!(
+            tail.is_empty() || tail.starts_with('.'),
+            "EOD 24:00 residual drift: {tail:?}"
+        );
         let next = next_day(&out[..10]);
         out.clear();
         match next {
             Some(d) => {
                 out.push_str(&d);
                 out.push_str("T00:00:00");
-                out.push_str(&residual);
+                out.push_str(&tail);
             }
             // 9999-12-31 end-of-day = the last instant: clamp, one shape
             None => max_instant(out),
@@ -275,18 +283,10 @@ fn to_canonical(s: &str, out: &mut String) {
     // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
     // is not the ':' that would start seconds (nothing is left after the
     // tz strip, so a bare "HH:MM" tail is partial)
-    let minute_only = {
+    if {
         let b = out.as_bytes();
         out.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':')
-    };
-    if minute_only {
-        // FULL_ISO_RE forbids frac-on-minutes wholesale (a frac may only
-        // follow seconds): after the tz strip a partial HH:MM tail is
-        // exactly the string's end. A regex relaxation leaking one in
-        // must fail LOUD — ".5" on minutes silently read as half a second
-        // would be a wrong instant, no panic (the drift trap is_eod_24
-        // closes for hour 24, mirrored here for normal hours).
-        assert!(out.len() == 16, "frac-on-minutes drift: {out:?}");
+    } {
         out.insert_str(16, ":00");
     }
     if let Some(i) = out.find('.') {
@@ -300,6 +300,7 @@ fn to_canonical(s: &str, out: &mut String) {
         out.push('.');
         out.push_str(ZEROS);
     }
+    assert_canonical_shape(out);
 }
 
 /// Normalize a matched timestamp for lexicographic compare: always
@@ -371,11 +372,10 @@ fn next_day(date: &str) -> Option<String> {
 /// ponytail: derived through to_canonical so the shape has one source; the
 /// NINES const is compile-time-checked against MAX_FRAC.
 fn max_instant(out: &mut String) {
+    // gate-checked output: '.' at 19, frac at 20.. — overwrite it, no
+    // find/unreachable needed
     to_canonical("9999-12-31T23:59:59", out);
-    match out.find('.') {
-        Some(i) => out.replace_range(i + 1.., NINES),
-        None => unreachable!("to_canonical always pads a frac"),
-    }
+    out.replace_range(20.., NINES);
 }
 
 enum Run {
@@ -550,28 +550,19 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
     (stdout, child)
 }
 
-/// Canonical-shape gate shared by BOTH gcloud pushdown embedders
-/// (server_ts, until_server_bound): the canonical string is a full
-/// datetime with a MAX_FRAC-padded frac. Drift means a silently wrong or
-/// garbage gcloud literal — panic loud, naming the string, in ONE
-/// unified message (field digit-ness included, so the downstream
-/// parse/expects can never fire first).
+/// Canonical-shape gate: to_canonical's ONLY legal output — full datetime,
+/// len 39 (19 + '.' + MAX_FRAC), separators pinned, every other byte a
+/// digit. ONE gate at every to_canonical exit covers every compare (bounds
+/// and per-line alike) and every pushdown embedder; drift panics loud,
+/// naming the string.
 fn assert_canonical_shape(canonical: &str) {
     let b = canonical.as_bytes();
-    let digits = |r: std::ops::Range<usize>| b[r].iter().all(|c| c.is_ascii_digit());
-    let digits_from = |r: std::ops::RangeFrom<usize>| b[r].iter().all(|c| c.is_ascii_digit());
+    let sep = [4usize, 7, 10, 13, 16, 19];
+    let seps = [b'-', b'-', b'T', b':', b':', b'.'];
     let ok = b.len() == 19 + 1 + MAX_FRAC
-        && b[4] == b'-' && b[7] == b'-' && b[10] == b'T'
-        && b[13] == b':'
-        && b[16] == b':'
-        && b[19] == b'.'
-        && digits(0..4)
-        && digits(5..7)
-        && digits(8..10)
-        && digits(11..13)
-        && digits(14..16)
-        && digits(17..19)
-        && digits_from(20..);
+        && sep.iter().zip(seps).all(|(i, s)| b[*i] == s)
+        && b.iter().enumerate()
+            .all(|(i, c)| sep.contains(&i) || c.is_ascii_digit());
     assert!(ok, "canonical shape drift: {canonical:?}");
 }
 
