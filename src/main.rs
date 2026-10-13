@@ -103,11 +103,35 @@ fn is_full_iso(s: &str) -> bool {
     if !FULL_ISO_RE.is_match(s) {
         return false;
     }
-    // calendar sanity: month 1-12, day 1-31 (catches 2026-99-99, Feb 99)
+    // calendar sanity: month 1-12, day 1-31 (catches 2026-99-99, Feb 99);
+    // with a time present, hour <= 23, minute <= 59, second <= 59
+    // (T99:99:99 would mis-order locally and be unembeddable server-side)
     let b = s.as_bytes();
     let m = ((b[5] - b'0') as u32) * 10 + (b[6] - b'0') as u32;
     let d = ((b[8] - b'0') as u32) * 10 + (b[9] - b'0') as u32;
-    (1..=12).contains(&m) && (1..=31).contains(&d)
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return false;
+    }
+    if b.len() > 10 {
+        // FULL_ISO_RE only allows a time tail as [ T]HH:MM(:SS...)? — an
+        // offset/UTC suffix starts at/before byte 13 as ':'; if bytes 11-15
+        // are HH:MM then any tz tail begins after byte 16
+        let h = ((b[11] - b'0') as u32) * 10 + (b[12] - b'0') as u32;
+        if !(0..=23).contains(&h) {
+            return false;
+        }
+        let mi = ((b[14] - b'0') as u32) * 10 + (b[15] - b'0') as u32;
+        if !(0..=59).contains(&mi) {
+            return false;
+        }
+        if b.len() >= 19 && b[16] == b':' {
+            let sec = ((b[17] - b'0') as u32) * 10 + (b[18] - b'0') as u32;
+            if sec > 59 {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Broken pipe (consumer left: head, grep -q) exits quietly; any other write
@@ -235,10 +259,14 @@ fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
 fn canonical_bound(s: &str, until: bool) -> String {
     if until && s.len() == 10 {
         // RAW date-only: next-day start (padding as an exclusive bound
-        // would exclude the whole end day) — then get the full shape too
-        let d = next_day_start(s);
+        // would exclude the whole end day). No next day exists past
+        // 9999-12-31: clamp to the max canonical instant — the whole
+        // end day survives, and the string stays an embeddable literal.
         let mut out = String::new();
-        to_canonical(&d, &mut out);
+        match next_day_start(s) {
+            Some(d) => to_canonical(&d, &mut out),
+            None => out.push_str(MAX_INSTANT),
+        }
         return out;
     }
     let mut out = String::new();
@@ -246,8 +274,13 @@ fn canonical_bound(s: &str, until: bool) -> String {
     out
 }
 
-/// One date increment, no chrono: manual month/leap arithmetic.
-fn next_day_start(date: &str) -> String {
+/// The last canonical instant (9999-12-31 end): the clamp for --until when
+/// no next day exists — keeps the whole end day, embeds as a valid literal.
+const MAX_INSTANT: &str = "9999-12-31T23:59:59.9999999999999999999";
+
+/// One date increment, no chrono: manual month/leap arithmetic. None when
+/// there is no next day (9999-12-31).
+fn next_day_start(date: &str) -> Option<String> {
     let (mut y, mut m, mut d) = (
         date[..4].parse::<u16>().unwrap_or(0),
         date[5..7].parse::<u8>().unwrap_or(12),
@@ -267,12 +300,10 @@ fn next_day_start(date: &str) -> String {
         if m > 12 { m = 1; y += 1; }
     }
     if y > 9999 {
-        // 9999-12-31 + 1: no next day. A "10000-…" string would sort
-        // BEFORE "9999-…", so return a sentinel that sorts ABOVE every
-        // 9999-12-31 instant ('T' < U+10FFFF) — the whole end day is kept.
-        return format!("9999-12-31\u{10FFFF}");
+        return None; // 9999-12-31 has no next day (a "10000-…" string
+                     // would sort BEFORE "9999-…")
     }
-    format!("{:04}-{:02}-{:02}T00:00:00", y, m, d)
+    Some(format!("{:04}-{:02}-{:02}T00:00:00", y, m, d))
 }
 
 enum Run {
@@ -447,20 +478,16 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
     (stdout, child)
 }
 
-/// Server-filter literal: canonical's 19-digit frac tail is pure padding —
-/// strip trailing zeros (an all-zero frac becomes plain seconds, so the
-/// fetch never bets on a parser accepting >9-digit fracs). The local
-/// canonical filter still applies the exact compare to returned entries.
-/// ponytail: nanosecond-max literal if GCP ever complains about more.
+/// Server-filter literal: plain seconds — drop the canonical frac pad
+/// whole. since >= on the floor second is fine (sub-second extras are
+/// dropped locally); until embeds <= on the SAME floor second so everything
+/// the local `<` keeps is returned server-side.
+/// ponytail: second-precision pushdown, no frac at all — GCP parser risk
+/// gone; nanosecond pushdown if narrowing ever needs to go finer.
 fn server_ts(canonical: &str) -> &str {
-    let Some(i) = canonical.find('.') else {
-        return canonical;
-    };
-    let frac = canonical[i + 1..].trim_end_matches('0');
-    if frac.is_empty() {
-        &canonical[..i]
-    } else {
-        &canonical[..i + 1 + frac.len()]
+    match canonical.find('.') {
+        Some(i) => &canonical[..i],
+        None => canonical,
     }
 }
 
@@ -478,12 +505,13 @@ fn make_reader(
     if let Some(filter) = &args.gcloud {
         let mut gc_filter = filter.clone();
         // bounds already canonicalized: no space separator remains; the
-        // embed takes padding's trailing zeros off (server_ts)
+        // embed is plain seconds (server_ts) — until is <= its floor second
+        // so the local exact filter never misses a kept entry
         if let Some(s) = since_valid {
             gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", server_ts(s)));
         }
         if let Some(u) = until_valid {
-            gc_filter.push_str(&format!(" AND timestamp<\"{}\"", server_ts(u)));
+            gc_filter.push_str(&format!(" AND timestamp<=\"{}\"", server_ts(u)));
         }
         let gc_args = vec![
             "logging".to_string(), "read".to_string(), gc_filter,
@@ -695,14 +723,17 @@ fn main() {
         exit(1);
     }
 
-    // Single warning loop over both time bounds: unusable bounds must be loud
+    // Fail fast on unusable time bounds: warn-and-stream would pour an
+    // unfiltered GB log (or pushdown) out over one stderr line. exit 2 =
+    // usage error, distinct from read/write failures.
     for (label, bound) in [("since", &args.since), ("until", &args.until)] {
         if let Some(b) = bound {
             if !is_full_iso(b) {
                 eprintln!(
-                    "Warning: --{} {:?} is not a full ISO date (YYYY-MM-DD or with time); the filter may be a no-op.",
+                    "Error: --{} {:?} is not a full ISO date (YYYY-MM-DD or with time).",
                     label, b
                 );
+                exit(2);
             }
         }
     }
@@ -759,13 +790,14 @@ fn main() {
         eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
     }
 
-    // Bounds are fixed for the whole run: validate + canonicalize once, not
-    // per line. Date-only bounds grow day-start (since) / next-day (until)
-    // times so the end day isn't excluded wholesale; spaces become 'T'.
+    // Bounds are fixed for the whole run: validate (fail-fast above) +
+    // canonicalize once, not per line. Date-only bounds grow day-start
+    // (since) / next-day (until) times so the end day isn't excluded
+    // wholesale; spaces become 'T'.
     let since_valid: Option<String> = args.since.as_ref()
-        .filter(|s| is_full_iso(s)).map(|s| canonical_bound(s, false));
+        .map(|s| canonical_bound(s, false));
     let until_valid: Option<String> = args.until.as_ref()
-        .filter(|u| is_full_iso(u)).map(|u| canonical_bound(u, true));
+        .map(|u| canonical_bound(u, true));
     let range_filter = since_valid.is_some() || until_valid.is_some();
 
     let (reader, fetched_child) = make_reader(&args, &since_valid, &until_valid);

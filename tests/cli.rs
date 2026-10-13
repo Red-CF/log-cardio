@@ -435,33 +435,43 @@ fn date_only_ts_passes_its_own_since_day() {
 
 #[test]
 fn impossible_date_bound_is_rejected() {
-    // calendar sanity: 2026-99-99 must be warned about, not silently trusted
+    // calendar sanity: 2026-99-99 fails fast — an unusable bound must not
+    // stream an unfiltered GB log
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .args(["--until", "2026-99-99"])
         .output()
         .expect("cardio binary should run");
+    assert!(!out.status.success(), "invalid bound must fail fast");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not a full ISO"), "got: {err:?}");
 }
 
 #[test]
-fn frac_on_minutes_bound_is_rejected_as_noop() {
+fn out_of_range_time_bound_is_rejected() {
+    // hour/minute sanity: T99:99:99 would mis-order locally and be
+    // unembeddable server-side — fail fast like a bad date
+    for b in ["2026-10-09T99:99:99", "2026-10-09T12:99:00", "2026-10-09T24:00:00"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+            .args(["--since", b])
+            .output()
+            .expect("cardio binary should run");
+        assert!(!out.status.success(), "{b} must fail fast, got: {:?}", out.status);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not a full ISO"), "{b}: got: {err:?}");
+    }
+}
+
+#[test]
+fn frac_on_minutes_bound_is_rejected() {
     // a frac on minutes is no real grammar — rejected like any invalid ts
-    // (warned no-op, every line passes), never mis-canonicalized
     let path = fixture("2026-10-09T12:34:30 event\n");
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .args([path.0.to_string_lossy().as_ref(), "--since", "2026-10-09T12:34.5"])
         .output()
         .expect("cardio binary should run");
-    assert!(
-        out.status.success(),
-        "stderr: {:?}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(!out.status.success(), "invalid bound must fail fast");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not a full ISO"), "got: {err:?}");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("event"), "no-op bound keeps lines, got: {stdout:?}");
 }
 
 #[test]
@@ -531,6 +541,41 @@ fn gcloud_filter_embeds_plain_seconds() {
     // ts trimmed out of it by the normal pipeline
     let echo = String::from_utf8_lossy(&out.stderr);
     assert!(echo.contains("timestamp>=\"2026-10-09T00:00:00\""), "got: {echo:?}");
-    assert!(echo.contains("timestamp<\"2026-10-09T12:34:45.5\""), "got: {echo:?}");
+    assert!(echo.contains("timestamp<=\"2026-10-09T12:34:45\""), "until embeds <= its floor second");
     assert!(!echo.contains("0000000000"), "bare 19-digit pad leaked to the server: {echo:?}");
+    assert!(!echo.contains(".5\""), "frac leaked to the server literal: {echo:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn gcloud_last_year_bounds_embed_valid_literal() {
+    // the 9999 clamp must stay an RFC3339-valid literal server-side, not
+    // leak the internal sentinel shape
+    let fake = std::env::temp_dir().join(format!(
+        "cardio_fakegc2_{}",
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join("gcloud");
+    std::fs::write(&script, "#!/bin/sh\necho \"$3\" >&2\n") // argv: logging read FILTER
+        .expect("write fake gcloud");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake gcloud executable");
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--gcloud", "resource.type=x", "--until", "9999-12-31"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    assert!(
+        out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let echo = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        echo.contains("timestamp<=\"9999-12-31T23:59:59\""),
+        "clamped until embeds valid literal, got: {echo:?}"
+    );
 }
