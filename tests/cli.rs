@@ -1,10 +1,23 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// unique per test run: pid + counter — nanos collide when tests run in
+/// parallel and one fixture overwrites another's file mid-test
+static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn cardio(args: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .args(args)
         .output()
         .expect("cardio binary should run");
+    // a regression that exits early shows as empty output otherwise;
+    // asserting status keeps the failure honest
+    assert!(
+        out.status.success(),
+        "cardio exited {}: stderr: {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -16,11 +29,9 @@ impl Drop for Fixture {
 
 fn fixture(content: &str) -> Fixture {
     let path = std::env::temp_dir().join(format!(
-        "cardio_test_{}.log",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "cardio_test_{}_{}.log",
+        std::process::id(),
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::write(&path, content).expect("write fixture");
     Fixture(path)
@@ -196,4 +207,15 @@ fn stats_plus_summary_emits_nothing() {
     let out = cardio(&[path.0.to_string_lossy().as_ref(), "--stats", "--summary", "--trace", "req_([0-9]+)"]);
 
     assert_eq!(out.trim(), "", "got: {out:?}");
+}
+
+#[test]
+fn impossible_date_bound_is_rejected() {
+    // calendar sanity: 2026-99-99 must be warned about, not silently trusted
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--until", "2026-99-99"])
+        .output()
+        .expect("cardio binary should run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a full ISO"), "got: {err:?}");
 }

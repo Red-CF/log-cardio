@@ -6,6 +6,7 @@ use std::process::{Child, ChildStdout, Command, Stdio, exit};
 use bloomfilter::Bloom;
 use clap::Parser;
 use serde::{Serialize, Deserialize};
+use std::sync::LazyLock;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Trim noise from logs for LLM processing")]
 struct Args {
@@ -78,24 +79,23 @@ fn compile_regex(pattern: &str, source: &str) -> Regex {
     })
 }
 
-/// ISO-8601 date prefix (YYYY-MM-DD...) — only these sorts are safe for
-/// lexicographic range compare (string order == chronological order)
-fn is_iso_date(s: &str) -> bool {
-    let b = s.as_bytes();
-    b.len() >= 4 && b[..4].iter().all(u8::is_ascii_digit) && b.get(4) == Some(&b'-')
-}
+/// Full ISO structure: date, optional time (hh(:mm(:ss)?)?), optional
+/// fractional seconds + tz offset. ponytail: structural + calendar-sanity
+/// only — exact days-in-month and tz semantics stay out (chrono if needed).
+static FULL_ISO_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}(:\d{2}){1,2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$")
+        .unwrap()
+});
 
 fn is_full_iso(s: &str) -> bool {
-    if !is_iso_date(s) || s.len() < 10 { return false; }
-    let b = s.as_bytes();
-    if b[7] != b'-' || ![5, 6, 8, 9].iter().all(|i| u8::is_ascii_digit(&b[*i])) {
+    if !FULL_ISO_RE.is_match(s) {
         return false;
     }
-    // ponytail: tail chars restricted — bounds are embedded verbatim in the
-    // gcloud GQL filter, so a stray quote or letter would corrupt the query.
-    b[10..].iter().all(|c| {
-        u8::is_ascii_digit(c) || matches!(c, b':' | b'T' | b'Z' | b'.' | b'+' | b'-' | b' ')
-    })
+    // calendar sanity: month 1-12, day 1-31 (catches 2026-99-99, Feb 99)
+    let b = s.as_bytes();
+    let m = ((b[5] - b'0') as u32) * 10 + (b[6] - b'0') as u32;
+    let d = ((b[8] - b'0') as u32) * 10 + (b[9] - b'0') as u32;
+    (1..=12).contains(&m) && (1..=31).contains(&d)
 }
 
 /// Broken pipe (consumer left: head, grep -q) exits quietly; any other write
@@ -225,7 +225,7 @@ fn main() {
     if args.dedup && trace_mode {
         eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
     }
-    if args.stats && trace_mode {
+    if args.stats && (trace_mode || args.summary) {
         eprintln!("Note: --stats is survey mode; --trace/--summary ignored.");
     }
 
@@ -404,14 +404,17 @@ fn main() {
                         let len_before = summary_map.len();
                         match summary_map.entry(id) {
                             btree_map::Entry::Occupied(mut e) => {
+                                // reuse the last-event buffer, no per-event alloc
                                 let s = e.get_mut();
                                 s.0 += 1;
-                                s.2 = final_line.to_string();
+                                s.2.clear();
+                                s.2.push_str(final_line);
                                 count += 1;
                             }
                             btree_map::Entry::Vacant(e) => {
                                 if len_before < MAX_TRACE_SESSIONS {
-                                    e.insert((1, final_line.to_string(), final_line.to_string()));
+                                    let l = final_line.to_string();
+                                    e.insert((1, l.clone(), l));
                                     count += 1;
                                 } else {
                                     sessions_capped = true;
