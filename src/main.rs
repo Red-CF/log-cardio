@@ -104,8 +104,13 @@ fn is_full_iso(s: &str) -> bool {
         return false;
     }
     // calendar sanity: month 1-12, day 1-31 (catches 2026-99-99, Feb 99);
-    // with a time present, hour <= 23, minute <= 59, second <= 59
-    // (T99:99:99 would mis-order locally and be unembeddable server-side)
+    // with a time present, hour <= 24 (only exactly 24:00(:00) passes, via
+    // is_eod_24 which to_canonical's rewrite shares — no drift), minute
+    // <= 59, second <= 59 (T99:99:99 would mis-order locally and be
+    // unembeddable server-side; leap seconds :60 are rejected too)
+    // ponytail: byte checks at fixed offsets — keep in sync with
+    // FULL_ISO_RE above; capture-group parsing would stay safe under
+    // regex relaxations but costs on this hot path
     let b = s.as_bytes();
     let m = ((b[5] - b'0') as u32) * 10 + (b[6] - b'0') as u32;
     let d = ((b[8] - b'0') as u32) * 10 + (b[9] - b'0') as u32;
@@ -181,6 +186,7 @@ fn flush(outbuf: &mut Sink) {
 /// order blurs). Compare numerically via chrono if that ever matters.
 const MAX_FRAC: usize = 19;
 const ZEROS: &str = "0000000000000000000"; // MAX_FRAC zeros
+const NINES: &str = "9999999999999999999"; // MAX_FRAC nines (max_instant)
 
 /// tz-naive suffix strip (call AFTER space→'T'): trailing 'Z' or a
 /// ±dd(:?dd)? tail. Byte checks, not regex — every line passes here.
@@ -205,6 +211,16 @@ fn strip_tz(out: &mut String) {
     } else if sign(five) && digits(five + 1..n) {
         out.truncate(five); // ±dddd
     }
+}
+
+/// ISO 8601 end-of-day "T24:00(:00…0)" — valid only with zero minutes (and
+/// zero seconds when present). THE one home of the rule: is_full_iso
+/// validates through it, to_canonical rewrites exactly what it accepts —
+/// the two can't drift.
+fn is_eod_24(b: &[u8]) -> bool {
+    b[11] == b'2' && b[12] == b'4' && b[13] == b':'
+        && b[14] == b'0' && b[15] == b'0'
+        && (b.len() < 19 || b[16] != b':' || (b[17] == b'0' && b[18] == b'0'))
 }
 
 /// THE single canonical-for-compare writer: space→'T' (" " < "T" would
@@ -232,17 +248,22 @@ fn to_canonical(s: &str, out: &mut String) {
     }
     // ISO 8601 end-of-day "T24:00(:00)" = the NEXT day's 00:00:00 — left
     // alone, "…T24:…" would sort after everything yet before the next
-    // day's "T00:…" (compare order broken across the boundary). Any
-    // residual frac tail is preserved and padded below.
-    let b = out.as_bytes();
-    if out.len() >= 16 && b[11] == b'2' && b[12] == b'4' && b[13] == b':' && b[14] == b'0' && b[15] == b'0' {
-        let canon = match next_day_start(&out[..10]) {
-            Some(d) => format!("{}{}", d, &out[19.min(out.len())..]),
-            // 9999-12-31 end-of-day = the last instant: clamp, one shape
-            None => "9999-12-31T23:59:59.".to_string() + ZEROS,
-        };
+    // day's "T00:…" (compare order broken across the boundary). The shape
+    // rule lives in is_eod_24 (shared with is_full_iso); any residual frac
+    // tail is preserved and padded below.
+    if out.len() >= 16 && is_eod_24(out.as_bytes()) {
+        let residual = out[19.min(out.len())..].to_string();
+        let next = next_day(&out[..10]);
         out.clear();
-        out.push_str(&canon);
+        match next {
+            Some(d) => {
+                out.push_str(&d);
+                out.push_str("T00:00:00");
+                out.push_str(&residual);
+            }
+            // 9999-12-31 end-of-day = the last instant: clamp, one shape
+            None => max_instant(out),
+        }
     }
     // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
     // is not the ':' that would start seconds (nothing is left after the
@@ -286,14 +307,12 @@ fn canonical_bound(s: &str, until: bool) -> String {
     if until && s.len() == 10 {
         // RAW date-only: next-day start (padding as an exclusive bound
         // would exclude the whole end day). No next day exists past
-        // 9999-12-31: clamp to the max canonical instant — the whole
+        // 9999-12-31: clamp to the max instant (nines frac) — the whole
         // end day survives, and the string stays an embeddable literal.
         let mut out = String::new();
-        match next_day_start(s) {
+        match next_day(s) {
             Some(d) => to_canonical(&d, &mut out),
-            // derive the clamp from to_canonical itself — one source of
-            // shape (a hand-built const would drift on MAX_FRAC changes)
-            None => to_canonical("9999-12-31T23:59:59", &mut out),
+            None => max_instant(&mut out),
         }
         return out;
     }
@@ -302,9 +321,10 @@ fn canonical_bound(s: &str, until: bool) -> String {
     out
 }
 
-/// One date increment, no chrono: manual month/leap arithmetic. None when
-/// there is no next day (9999-12-31).
-fn next_day_start(date: &str) -> Option<String> {
+/// One date increment, no chrono: manual month/leap arithmetic. Returns
+/// the DATE alone (callers write their own "T…" time) or None when there
+/// is no next day (9999-12-31).
+fn next_day(date: &str) -> Option<String> {
     let (mut y, mut m, mut d) = (
         date[..4].parse::<u16>().unwrap_or(0),
         date[5..7].parse::<u8>().unwrap_or(12),
@@ -327,7 +347,20 @@ fn next_day_start(date: &str) -> Option<String> {
         return None; // 9999-12-31 has no next day (a "10000-…" string
                      // would sort BEFORE "9999-…")
     }
-    Some(format!("{:04}-{:02}-{:02}T00:00:00", y, m, d))
+    Some(format!("{:04}-{:02}-{:02}", y, m, d))
+}
+
+/// Clamp target for bounds escaping 9999-12-31: the maximal canonical
+/// instant. The frac is NINES, not zeros — an exclusive until at the last
+/// day must admit instants inside the final second (.5 >= a zeros-pad
+/// bound would drop them; pad ZEROS is to_canonical's shape by default).
+/// ponytail: derived through to_canonical so the shape has one source.
+fn max_instant(out: &mut String) {
+    to_canonical("9999-12-31T23:59:59", out);
+    match out.find('.') {
+        Some(i) => out.replace_range(i + 1.., NINES),
+        None => unreachable!("to_canonical always pads a frac"),
+    }
 }
 
 enum Run {
@@ -505,22 +538,27 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
 /// Server-pushdown literal for an --until bound: `<` one second past the
 /// bound's floor second. (`<=` the floor second would EXCLUDE (floor, frac)
 /// entries the local filter keeps — a plain "…45" literal is instant 45.0,
-/// not the whole second.) None past 9999-12-31T23:59:59 (no next second —
-/// the embed is dropped; the local exact filter still bounds the stream).
+/// not the whole second.) None only when no next second exists (9999) —
+/// the caller drops the clause; the local exact filter still bounds it.
+/// The canonical shape is a to_canonical invariant: a drifting input
+/// panics (loud) instead of silently widening the fetch.
 fn until_server_bound(canonical: &str) -> Option<String> {
-    let dot = canonical.find('.')?;
+    assert!(
+        canonical.find('.').is_some() && canonical.len() > 19,
+        "canonical shape drift: {canonical:?}"
+    );
     let mut date = canonical[..10].to_string();
-    let mut h: u32 = canonical[11..13].parse().ok()?;
-    let mut m: u32 = canonical[14..16].parse().ok()?;
-    let mut s: u32 = canonical[17..19].parse().ok()?;
+    let mut h: u32 = canonical[11..13].parse().expect("canonical hour");
+    let mut m: u32 = canonical[14..16].parse().expect("canonical minute");
+    let mut s: u32 = canonical[17..19].parse().expect("canonical second");
     s += 1;
     if s == 60 { s = 0; m += 1; }
     if m == 60 { m = 0; h += 1; }
     if h == 24 {
         h = 0;
-        date = next_day_start(&date)?;
+        date = next_day(&date)?;
     }
-    Some(format!("{}T{:02}:{:02}:{:02}", date, h, m, s))
+    Some(format!("{date}T{h:02}:{m:02}:{s:02}"))
 }
 
 /// since-pushdown literal: the bound's floor second — entries from it on

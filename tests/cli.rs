@@ -586,3 +586,28 @@ fn gcloud_last_year_until_skips_embed() {
     assert!(echo.contains("resource.type=x"), "got: {echo:?}");
     assert!(!echo.contains("timestamp<"), "no next second -> no until embed, got: {echo:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn gcloud_until_day_rollover_embeds_next_day() {
+    // regression: 23:59:59 until rolls s→m→h→day; the old code re-suffixed
+    // next_day's full datetime → "…T00:00:00T00:00:00" garbage literal
+    let echo = fake_gcloud(&["--gcloud", "resource.type=x", "--until", "2026-10-09T23:59:59"]);
+
+    assert!(
+        echo.contains("timestamp<\"2026-10-10T00:00:00\""),
+        "day-roll embeds one well-formed literal, got: {echo:?}"
+    );
+    assert!(!echo.contains("T00:00:00T"), "double datetime suffix leaked: {echo:?}");
+}
+
+#[test]
+fn last_year_final_second_fracs_survive_until() {
+    // the 9999 clamp's frac is nines, not zeros: an until at the last day
+    // must admit entries inside the final second (.000 pad would drop .5)
+    let path = fixture("9999-12-31T23:59:59.5 last instant\n9999-12-31T12:00:00 day\n");
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "9999-12-31"]);
+
+    assert!(out.contains("day"), "got: {out:?}");
+    assert!(out.contains("last instant"), "mid-second instant stays under the clamp, got: {out:?}");
+}
