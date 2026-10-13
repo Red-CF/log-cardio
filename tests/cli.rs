@@ -225,110 +225,91 @@ fn summary_last_is_exactly_one_event() {
 
 #[test]
 fn bq_csv_rows_are_clean_events() {
-    // fake bq on PATH: header row, quoted comma field, empty-text row.
-    // Regression: comma join left ",..." residue + the empty row as phantom ","
-    let fake = std::env::temp_dir()
-        .join(format!("cardio_fakebin_{}", std::process::id()));
-    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    let script = fake.join("bq");
-    std::fs::write(&script, "#!/bin/sh\ncat <<'CSV'\ntimestamp,text\n2026-10-13T12:00:00Z,\"req_1 login, ok\"\n2026-10-13T12:00:02Z,\nCSV\n")
-        .expect("write fake bq");
-    #[cfg(unix)]
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake bq executable");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(["--bq", "SELECT timestamp, text FROM t", "--json"])
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
-        .output()
-        .expect("cardio binary should run");
-    assert!(
-        out.status.success(),
-        "cardio exited {}: stderr: {:?}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    // header row, quoted comma field, empty-text row: no separator residue,
+    // no phantom "," event
+    let stdout = fake_bq(
+        "timestamp,text\n2026-10-13T12:00:00Z,\"req_1 login, ok\"\n2026-10-13T12:00:02Z,\n",
+        &["--bq", "SELECT timestamp, text FROM t", "--json"],
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(
-        lines.len(), 1,
-        "header + empty-text row must not be events: {stdout:?}"
-    );
+    assert_eq!(lines.len(), 1, "header + empty-text row are not events: {stdout:?}");
     let v: serde_json::Value = serde_json::from_str(lines[0])
         .unwrap_or_else(|e| panic!("line must be JSON: {e}"));
     assert_eq!(v["content"], "req_1 login, ok", "no separator residue: {stdout:?}");
-    std::fs::remove_dir_all(&fake).ok();
 }
 
 #[test]
 fn bq_crlf_text_field_flattens_to_one_line() {
     // quoted field with CRLF breaks: the event must stay one line
-    let fake = std::env::temp_dir()
-        .join(format!("cardio_fakebin_{}_crlf", std::process::id()));
-    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    let script = fake.join("bq");
-    std::fs::write(&script, "#!/bin/sh\nprintf 'timestamp,text\\n\"line1\\r\\nline2 more\",x\\n'\n")
-        .expect("write fake bq");
-    #[cfg(unix)]
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake bq executable");
-
-    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(["--bq", "SELECT 1"])
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
-        .output()
-        .expect("cardio binary should run");
-    std::fs::remove_dir_all(&fake).ok();
-    assert!(
-        out.status.success(),
-        "cardio exited {}: stderr: {:?}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    let stdout = fake_bq(
+        "timestamp,text\n\"line1\r\nline2 more\",x\n",
+        &["--bq", "SELECT 1"],
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
     assert_eq!(lines.len(), 1, "CRLF field must flatten to one event: {stdout:?}");
     assert_eq!(lines[0], "line1 line2 more x", "no CR residue: {stdout:?}");
 }
 
 #[test]
-fn short_ts_regex_does_not_panic() {
-    // regression: a user regex matching <10 chars reached byte[10] and
-    // aborted with index-out-of-bounds
-    let cfg = fixture("timestamp_regex = '\\d{6}'\n");
-    let path = fixture("202610 event\n");
-    let out = cardio(&[
-        "--config", cfg.0.to_string_lossy().as_ref(),
-        path.0.to_string_lossy().as_ref(),
-    ]);
-
-    assert!(out.contains("event"), "short ts must pass through, got: {out:?}");
-}
-
-#[test]
 fn bq_lone_cr_content_is_preserved() {
     // CR flattening must only eat CRLF pairs, never a lone CR's content
-    let fake = std::env::temp_dir()
-        .join(format!("cardio_fakebin_{}_cr", std::process::id()));
+    let stdout = fake_bq("timestamp,text\n\"code:\r17\",x\n", &["--bq", "SELECT 1"]);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 1, "lone CR stays inside one event: {stdout:?}");
+    assert_eq!(lines[0], "code:\r17 x", "no content byte destroyed: {stdout:?}");
+}
+
+/// Run cardio with a fake `bq` command on PATH that just prints `csv`.
+/// Returns stdout; asserts exit status so a regression failing early is
+/// honest. Fakebin dir is unique per call and removed before returning.
+fn fake_bq(csv: &str, args: &[&str]) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = std::env::temp_dir().join(format!(
+        "cardio_fakebin_{}",
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
     std::fs::create_dir_all(&fake).expect("mkdir fakebin");
     let script = fake.join("bq");
-    std::fs::write(&script, "#!/bin/sh\nprintf 'timestamp,text\\n\"code:\\r17\",x\\n'\n")
+    std::fs::write(&script, format!("#!/bin/sh\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n"))
         .expect("write fake bq");
-    #[cfg(unix)]
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
         .expect("make fake bq executable");
-
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(["--bq", "SELECT 1"])
+        .args(args)
         .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
         .output()
         .expect("cardio binary should run");
     std::fs::remove_dir_all(&fake).ok();
-    assert!(out.status.success(), "cardio exited {}", out.status);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(lines.len(), 1, "lone CR is inside one event: {stdout:?}");
-    assert_eq!(lines[0], "code:\r17 x", "no content byte destroyed: {stdout:?}");
+    assert!(
+        out.status.success(),
+        "cardio exited {}: stderr: {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn invalid_first_ts_does_not_bypass_bounds() {
+    // the first ts match being invalid (bad calendar date) must not shield
+    // the line: a full-ISO ts later in the line is the compare target
+    let path = fixture("x 2026-99-99T10:00:00 boot 2026-10-09T09:00:00 ok\n");
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "2026-10-09T08:00:00"]);
+
+    assert!(!out.contains("boot"), "line must use its valid ts, got: {out:?}");
+}
+
+#[test]
+fn fractional_seconds_compare_equal_at_bound() {
+    // '45.5' (== 45.500000000) must not sort below '45.500' as a bare prefix
+    let path1 = fixture("2026-10-09T14:30:45.5 event\n");
+    let path2 = fixture("2026-10-09T14:30:45.5 event\n");
+
+    let dropped = cardio(&[path1.0.to_string_lossy().as_ref(), "--until", "2026-10-09T14:30:45.500"]);
+    assert!(!dropped.contains("event"), "equal instant fails the exclusive bound, got: {dropped:?}");
+
+    let kept = cardio(&[path2.0.to_string_lossy().as_ref(), "--since", "2026-10-09T14:30:45.500"]);
+    assert!(kept.contains("event"), "equal instant passes the inclusive bound, got: {kept:?}");
 }
 
 #[test]

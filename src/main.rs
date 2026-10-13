@@ -135,38 +135,43 @@ fn flush(outbuf: &mut Sink) {
 }
 
 /// Padding for partial-precision ISO matches: date-only = day start,
-/// hour = ":00:00", minute = ":00" — full precision never left un-padded,
-/// so a partial ts never compares as a bare prefix below its own instant.
-/// Single invariant used by both the line side and the bounds side.
+/// minute = ":00", so a partial ts never compares as a bare prefix below
+/// its own instant. 13 (hour-only) can never pass is_full_iso, so it has
+/// no arm. Single invariant shared by the line side and the bounds side.
 fn partial_pad(ts_len: usize) -> Option<&'static str> {
     match ts_len {
         10 => Some("T00:00:00"),
-        13 => Some(":00:00"),
         16 => Some(":00"),
         _ => None,
     }
 }
 
+/// Fractional-second digits to add: "45.5" pads to 9 frac digits so equal
+/// instants compare EQUAL to "45.500000000", never below.
+fn short_frac_pad(s: &str) -> Option<usize> {
+    s.find('.').map(|i| 9 - (s.len() - i - 1)).filter(|&n| n > 0)
+}
+
 fn pad_partial(s: &str) -> String {
-    match partial_pad(s.len()) {
-        Some(p) => format!("{}{}", s, p),
+    if let Some(p) = partial_pad(s.len()) {
+        return format!("{}{}", s, p);
+    }
+    match short_frac_pad(s) {
+        Some(n) => format!("{}{}", s, "0".repeat(n)),
         None => s.to_string(),
     }
 }
 
 /// Normalize a matched timestamp for lexicographic compare against the
 /// "T"-separated bounds: a space separator converts to 'T' (" " < "T" would
-/// mis-order) and partial precision gets padded (partial_pad). ts shorter
-/// than a full date is returned untouched (a user regex can match shorter).
-/// Result is written into `buf` (reused per iteration) and returned as &str.
+/// mis-order), partial precision and short fractions get padded. Callers
+/// gate on is_full_iso, so ts is at least a full date (no length guard
+/// needed). Result is written into `buf` (reused) and returned as &str;
+/// unchanged matches return the borrowed slice (no copy on the hot path).
 fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
-    if ts.len() < 10 {
-        // crash guard: a user regex can match shorter than a full date
-        return ts;
-    }
-    let has_space = ts.len() > 10 && ts.as_bytes()[10] == b' ';
     let pads = partial_pad(ts.len());
-    if has_space || pads.is_some() {
+    let has_space = ts.len() > 10 && ts.as_bytes()[10] == b' ';
+    if has_space || pads.is_some() || short_frac_pad(ts).is_some() {
         buf.clear();
         if has_space {
             buf.push_str(&ts[..10]);
@@ -178,9 +183,11 @@ fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
         if let Some(p) = pads {
             buf.push_str(p);
         }
+        if let Some(n) = short_frac_pad(buf) {
+            for _ in 0..n { buf.push('0'); }
+        }
         buf.as_str()
     } else {
-        // unchanged: keep the borrowed slice, no copy on the hot path
         ts
     }
 }
@@ -313,8 +320,9 @@ impl Pipeline {
                             line.push_str(&String::from_utf8_lossy(f));
                         }
                         // flatten to one line: a quoted field's CRLF pair
-                        // collapses to one space; a LONE carriage return is
-                        // content and stays verbatim
+                        // collapses to one space; a lone carriage return
+                        // mid-line is content and stays verbatim (CR at row
+                        // edges is trim whitespace, as in every source)
                         if line.contains(['\n', '\r']) {
                             line = line.replace("\r\n", " ");
                             line = line.replace('\n', " ");
@@ -344,8 +352,14 @@ impl Pipeline {
             // real formats, so first-match is the intended ts; ISO strings
             // sort chronologically and space separators normalize to 'T'.
             if self.range_filter {
-                let lead = self.re_timestamp.find(line)
-                    .filter(|m| is_full_iso(m.as_str()))
+                // first FULL-ISO match, wherever it sits (brackets/level
+                // prefixes are common): an invalid earlier match (bad
+                // calendar date) must not shield the line or shadow a
+                // valid ts later in it. Apache-style lines have no ISO
+                // match at all and bypass. ponytail: ISO strings sort
+                // chronologically; space separators normalize to 'T'.
+                let lead = self.re_timestamp.find_iter(line)
+                    .find(|m| is_full_iso(m.as_str()))
                     .map(|m| m.as_str());
                 if let Some(ts) = lead {
                     let ts = normalize_iso(ts, &mut self.ts_norm);
