@@ -34,6 +34,7 @@ to read everything you kept.
 
 | Flag | Effect |
 |---|---|
+| `--tail N` | only the LAST N kept lines — reads the whole input, replaces the cap. The #1 read: "what does the log's latest say" |
 | `--raw` | skip the agent pipeline: no dedup, no cap (only trim still applies) |
 | `--query error` | keep only lines containing TEXT (substring) |
 | `--max-lines N` | cap output lines (raw mode: only when you pass it) |

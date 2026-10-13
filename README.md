@@ -58,6 +58,7 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | Flag | Effect |
 |---|---|
 | `[file]` | Log file. Omitted → stdin. |
+| `--tail N` | Only the LAST N kept lines (after dedup/query; reads the whole input, ignores the cap). |
 | `--raw` | Skip the default agent pipeline: no dedup, no line cap. |
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |

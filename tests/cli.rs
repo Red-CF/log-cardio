@@ -552,6 +552,31 @@ fn default_pipeline_dedups_and_caps_raw_skips_it() {
 }
 
 #[test]
+fn tail_keeps_last_n_after_dedup() {
+    // --tail N = last N KEPT lines (post-dedup): window slides, cap not
+    // applied, whole input read; --raw changes nothing about the window
+    let mut content = String::new();
+    content.push_str("2026-10-09T12:00:00 repeated start\n");
+    for i in 0..2100 {
+        content.push_str(&format!("2026-10-09T12:{:02}:{:02} unique-{i:04}\n", i / 60, i % 60));
+    }
+    content.push_str("2026-10-09T23:00:00 repeated start\n");
+    let path = fixture(&content);
+    let p = path.0.to_string_lossy().into_owned();
+
+    let out = cardio(&["--tail", "5", &p]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 5, "got {}", lines.len());
+    // the window is the last 5 KEPT lines; the trailing "repeated start"
+    // was already dropped by dedup before the window saw it
+    assert!(out.contains("unique-2099"), "latest line kept: {out:?}");
+    assert!(!out.contains("unique-0000") && !out.contains("repeated start"), "early lines excluded: {out:?}");
+    // json indices still reference the input line numbers
+    let j = cardio(&["--tail", "1", "--json", &p]);
+    assert!(j.contains("\"index\":") && j.lines().count() == 1, "got: {j:?}");
+}
+
+#[test]
 fn lean_signals_what_it_dropped() {
     // the default pipeline never drops silently: stderr must say how
     // many suspect duplicates were removed and that the cap cut the run

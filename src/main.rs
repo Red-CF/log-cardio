@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::{btree_map, BTreeMap, HashMap};
+use std::collections::{btree_map, BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdout, Command, Stdio, exit};
@@ -38,6 +38,12 @@ struct Args {
     /// Output in JSON format
     #[arg(long)]
     json: bool,
+
+    /// Only the last N kept lines (after dedup/query). Reads the WHOLE
+    /// input — the line cap does not apply; the tail replaces it. The
+    /// #1 agent read: "what did the log just say".
+    #[arg(long)]
+    tail: Option<usize>,
 
     /// Only lines with timestamp >= this (ISO, or YYYY-MM-DD = day start).
     #[arg(long)]
@@ -735,11 +741,18 @@ fn run_stream(
     let mut count = 0usize;
     let mut dedup_inserts = 0usize;
     let mut dropped_dups = 0usize;
+    // --tail: ring buffer of the last N KEPT lines, emitted after the
+    // loop. The whole input is read, so the line cap does not apply
+    // here; the tail value is the only window.
+    let mut tail_buf: VecDeque<(usize, String)> =
+        args.tail.map(|n| VecDeque::with_capacity(n)).unwrap_or_default();
     while let Some((line_no, line)) = proc.next_trimmed() {
-        if let Some(max) = args.max_lines {
-            if count >= max {
-                proc.early_cut = true;
-                break;
+        if args.tail.is_none() {
+            if let Some(max) = args.max_lines {
+                if count >= max {
+                    proc.early_cut = true;
+                    break;
+                }
             }
         }
         if let Some(ref mut b) = bloom {
@@ -750,6 +763,14 @@ fn run_stream(
             }
             // Track actual insertions: saturating past capacity = silent data loss
             dedup_inserts += 1;
+        }
+        if let Some(n) = args.tail {
+            // line_no preserved so --tail --json keeps input indices
+            if tail_buf.len() >= n {
+                tail_buf.pop_front();
+            }
+            tail_buf.push_back((line_no, line));
+            continue;
         }
         if args.json {
             // plain usize/String struct — serialization cannot fail
@@ -762,6 +783,18 @@ fn run_stream(
             emit(outbuf, &line);
         }
         count += 1;
+    }
+    // --tail: emit the buffered window (json kept in input-line order)
+    for (line_no, line) in tail_buf {
+        if args.json {
+            let json = serde_json::to_string(&LogEntry {
+                index: line_no,
+                content: line,
+            }).unwrap();
+            emit(outbuf, &json);
+        } else {
+            emit(outbuf, &line);
+        }
     }
     (dedup_inserts, dropped_dups)
 }
@@ -986,6 +1019,9 @@ fn main() {
     }
     if args.dedup && trace_re.is_some() {
         eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
+    }
+    if args.tail.is_some() && !matches!(run, Run::Stream) {
+        eprintln!("Note: --tail applies to the line stream; --stats/--trace/--summary ignore it.");
     }
 
     // Bounds are fixed for the whole run: validate (fail-fast above) +
