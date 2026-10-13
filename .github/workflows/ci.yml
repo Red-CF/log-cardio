@@ -64,42 +64,26 @@ jobs:
           fi
 
   release:
-    # a merge to main ships the crate: publish the version the PR bumped in
-    # Cargo.toml; if that version is already on crates.io (unbumped merge),
-    # bump the patch in the runner and publish that instead. Other publish
-    # failures (network, auth) still fail the job loudly.
+    # a merge to main ships the crate at the version the PR bumped to (the
+    # required `version` check guarantees that version isn't on crates.io
+    # yet; a same-version double merge would fail here — bump and re-merge)
     needs: [test, build, coverage]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # serialize: two near-simultaneous merges compete over version numbers
-    concurrency: release-crate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: cargo publish
-        id: pub
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          for attempt in 1 2 3; do
-            LOG=$(cargo publish 2>&1) && { echo "published=$V" >> "$GITHUB_OUTPUT"; exit 0; }
-            echo "$LOG"
-            if echo "$LOG" | grep -q "already exists on crates.io"; then
-              V="${V%.*}.$(( ${V##*.} + 1 ))"
-              sed -i "s/^version = \".*\"/version = \"$V\"/" Cargo.toml
-              echo "cargo: version merged is already published — shipping $V"
-            else
-              exit 1
-            fi
-          done
-          exit 1
+        run: cargo publish
       - name: tag + GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           git config user.name "Red-CF"
           git config user.email "crojasfer31@gmail.com"
-          git tag "v${{ steps.pub.outputs.published }}"
-          git push origin "v${{ steps.pub.outputs.published }}"
-          gh release create "v${{ steps.pub.outputs.published }}" --generate-notes
+          git tag "v$V"
+          git push origin "v$V"
+          gh release create "v$V" --generate-notes
