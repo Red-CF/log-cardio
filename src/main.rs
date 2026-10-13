@@ -259,18 +259,30 @@ fn to_canonical(s: &str, out: &mut String) {
     // alone, "…T24:…" would sort after everything yet before the next
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
-        let residual = out[19.min(out.len())..].to_string();
-        // Only empty or '.'-led DIGIT tails are real grammar; anything
-        // else here means upstream shape drifted. FULL_ISO_RE rejects it
-        // today, but the None branch below DISCARDS the residual —
-        // silently emitting a clamp — so this stays loud (the Some
-        // branch's junk is caught by the final gate; the clamp is not).
-        // out is still the (unmodified) input here: the message carries
-        // the whole string, grep-able like the sibling drift asserts.
+        // Byte 19 may sit inside drifted multibyte junk — the slice below
+        // would then panic with an unnamed index error BEFORE the named
+        // drift panic fires. Every ascii byte is a char boundary, so one
+        // ascii pass makes the slice safe AND gates the tail to
+        // grammar-ish bytes in the same check. (out here is post
+        // space→'T' and post tz-strip: the panic shows the normalized
+        // line, not the user's literal input.)
+        assert!(
+            out.as_bytes()[19.min(out.len())..].iter().all(|c| c.is_ascii()),
+            "EOD 24:00 residual drift: {out:?}"
+        );
+        let residual = out[19..].to_string();
+        // Only empty or '.'-led digit tails are real frac grammar.
+        // ponytail: drift net, second copy of FULL_ISO_RE's frac
+        // grammar — the None clamp branch below DISCARDS the residual
+        // silently, so this stays loud where the final gate is blind.
+        // Keep in sync if the frac grammar ever widens (comma frac
+        // etc.).
         assert!(
             residual.is_empty()
-                || (residual.starts_with('.') && all_digits(residual[1..].as_bytes())),
-            "EOD 24:00 residual drift: {out:?} (tail {residual:?})"
+                || (residual.len() > 1
+                    && residual.starts_with('.')
+                    && all_digits(residual[1..].as_bytes())),
+            "EOD 24:00 residual drift: {out:?}"
         );
         let next = next_day(&out[..10]);
         out.clear();
@@ -384,15 +396,11 @@ fn next_day(date: &str) -> Option<String> {
 fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
     // ZEROS → NINES is a digit-for-digit swap of the MAX_FRAC-width run
-    // (width compile-time-pinned), so the swap itself can't drift — but
-    // the HAND-CODED offset 20 has no other net: pin the layout the
-    // splice assumes (round-19 removed the redundant full shape gate;
-    // this one line is the runtime check those findings traded).
-    assert!(
-        out.as_bytes()[19] == b'.',
-        "max_instant splice drift: {out:?}"
-    );
+    // (width compile-time-pinned), so the swap can't change the shape —
+    // but this result itself flows UNGATED into the local compare path,
+    // so the nines instant is gate-checked like any other bound.
     out.replace_range(20.., NINES);
+    assert_canonical_shape(out); // the nines result is itself a bound
 }
 
 enum Run {
