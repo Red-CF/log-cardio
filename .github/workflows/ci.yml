@@ -57,9 +57,11 @@ jobs:
       - id: ver
         run: |
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          PUBLISHED=$(curl -sfL https://crates.io/api/v1/crates/log-cardio | jq -r .crate.max_version)
+          PUBLISHED=$(curl -sfL "https://crates.io/api/v1/crates/log-cardio/versions" | jq -r --arg v "$V" '[.[].num | select(. == $v)] | length')
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          [ "$V" != "$PUBLISHED" ] && echo "new=yes" >> "$GITHUB_OUTPUT" || true
+          # empty query result = registry unreachable: fail loud, don't re-publish
+          [ -n "$PUBLISHED" ] || exit 1
+          [ "$PUBLISHED" = "0" ] && echo "new=yes" >> "$GITHUB_OUTPUT" || true
       - name: cargo publish
         if: steps.ver.outputs.new == 'yes'
         env:
