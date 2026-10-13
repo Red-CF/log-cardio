@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  cobertura:
+  coverage:
     # coverage lives on its own named check: instrumented tests on Linux +
     # the gh-pages badge on main. Linux is covered here instead of `test` —
     # test keeps macos/windows only.
@@ -39,7 +39,7 @@ jobs:
   test:
     # the platform contract: file/stdin plus spawning gcloud/bq behave
     # differently per OS — needs a real run on all three (Linux runs inside
-    # the `cobertura` job, which is instrumented)
+    # the `coverage` job, which is instrumented)
     strategy:
       fail-fast: false
       matrix:
