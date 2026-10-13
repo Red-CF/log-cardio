@@ -94,8 +94,13 @@ fn compile_regex(pattern: &str, source: &str) -> Regex {
 /// log grammar and is rejected like any other invalid ts) + tz offset.
 /// ponytail: structural + calendar-sanity only — exact days-in-month
 /// and tz semantics stay out (chrono if needed).
+/// [0-9] over \d on purpose: regex \d is Unicode-aware and every byte
+/// check downstream (is_full_iso arithmetic, all_digits, truncate,
+/// shape gate) assumes ASCII digits — pinning the range retires the
+/// whole unicode-digit class at the grammar instead of netting it
+/// branch by branch.
 static FULL_ISO_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$")
+    Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}([ T][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)?$")
         .unwrap()
 });
 
@@ -259,18 +264,12 @@ fn to_canonical(s: &str, out: &mut String) {
     // alone, "…T24:…" would sort after everything yet before the next
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
-        // Byte 19 may sit inside drifted multibyte junk — the slice below
-        // would then panic with an unnamed index error BEFORE the named
-        // drift panic fires. Every ascii byte is a char boundary, so one
-        // ascii pass makes the slice safe AND gates the tail to
-        // grammar-ish bytes in the same check. (out here is post
-        // space→'T' and post tz-strip: the panic shows the normalized
-        // line, not the user's literal input.)
-        assert!(
-            out.as_bytes()[19.min(out.len())..].iter().all(|c| c.is_ascii()),
-            "EOD 24:00 residual drift: {out:?}"
-        );
-        let residual = out[19..].to_string();
+        // Residual = tail after the "…T24:00(:00)" head: empty for the
+        // minute-precision form ("T24:00", len 16). .get() instead of a
+        // slice keeps that case panic-free without bounds bookkeeping —
+        // FULL_ISO_RE is [0-9]-pinned above, so the tail is ascii and
+        // all_digits below cannot panic (no multibyte net needed).
+        let residual = out.get(19..).unwrap_or("").to_string();
         // Only empty or '.'-led digit tails are real frac grammar.
         // ponytail: drift net, second copy of FULL_ISO_RE's frac
         // grammar — the None clamp branch below DISCARDS the residual
@@ -395,12 +394,10 @@ fn next_day(date: &str) -> Option<String> {
 /// NINES const is compile-time-checked against MAX_FRAC.
 fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
-    // ZEROS → NINES is a digit-for-digit swap of the MAX_FRAC-width run
-    // (width compile-time-pinned), so the swap can't change the shape —
-    // but this result itself flows UNGATED into the local compare path,
-    // so the nines instant is gate-checked like any other bound.
+    // ZEROS → NINES: digit-for-digit swap of the MAX_FRAC-width run
+    // (width compile-time-pinned) over the to_canonical-gated shape —
+    // shape survives by construction, so no runtime net is added here.
     out.replace_range(20.., NINES);
-    assert_canonical_shape(out); // the nines result is itself a bound
 }
 
 enum Run {

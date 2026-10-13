@@ -480,6 +480,22 @@ fn iso_end_of_day_24_00_compares_as_next_day() {
 }
 
 #[test]
+fn minute_precision_eod_bound_clamps_to_next_day() {
+    // "T24:00" (len 16, no seconds) is the same rewrite path — a slice
+    // instead of .get() panicked here with a raw OOB (regression r21).
+    // The bound must canonicalize to next-day 00:00 exactly like the
+    // seconds form.
+    let path = fixture("2026-10-09T20:00:00 boot\n2026-10-10T00:00:00 up\n");
+    let p = path.0.to_string_lossy().into_owned();
+
+    let kept = cardio(&["--since", "2026-10-09T24:00", &p]);
+    assert!(kept.contains("up") && !kept.contains("boot"), "got: {kept:?}");
+
+    let dropped = cardio(&["--until", "2026-10-09T24:00Z", &p]);
+    assert!(dropped.contains("boot") && !dropped.contains("up"), "got: {dropped:?}");
+}
+
+#[test]
 fn frac_on_minutes_bound_is_rejected() {
     // a frac on minutes is no real grammar — rejected like any invalid ts
     let path = fixture("2026-10-09T12:34:30 event\n");
