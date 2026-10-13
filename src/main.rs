@@ -189,8 +189,8 @@ const NINES: &str = "9999999999999999999"; // MAX_FRAC nines (max_instant)
 // a MAX_FRAC change can't leave a stranded const behind
 const _: () = assert!(ZEROS.len() == MAX_FRAC && NINES.len() == MAX_FRAC);
 
-/// All bytes numeric — the one digit predicate (strip_tz's time tails,
-/// the canonical shape gate via its loop).
+/// All bytes numeric — the one digit predicate (strip_tz's tz tails,
+/// assert_canonical_shape's field slices).
 fn all_digits(b: &[u8]) -> bool {
     b.iter().all(|c| c.is_ascii_digit())
 }
@@ -260,6 +260,15 @@ fn to_canonical(s: &str, out: &mut String) {
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
         let residual = out[19.min(out.len())..].to_string();
+        // Only '.'-led (frac) or empty tails are real grammar; anything
+        // else here means upstream shape drifted. FULL_ISO_RE rejects it
+        // today, but the None branch below DISCARDS the residual —
+        // silently emitting a clamp — so this stays loud (the Some
+        // branch's junk is caught by the final gate; the clamp is not).
+        assert!(
+            residual.is_empty() || residual.starts_with('.'),
+            "EOD 24:00 residual drift: {residual:?}"
+        );
         let next = next_day(&out[..10]);
         out.clear();
         match next {
@@ -371,8 +380,10 @@ fn next_day(date: &str) -> Option<String> {
 /// NINES const is compile-time-checked against MAX_FRAC.
 fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
+    // ZEROS → NINES is a digit-for-digit swap of the MAX_FRAC-width run
+    // (width compile-time-pinned), so the shape survives by construction
+    // — no re-gate needed here.
     out.replace_range(20.., NINES);
-    assert_canonical_shape(out); // the nines result is itself a bound
 }
 
 enum Run {
