@@ -260,14 +260,17 @@ fn to_canonical(s: &str, out: &mut String) {
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
         let residual = out[19.min(out.len())..].to_string();
-        // Only '.'-led (frac) or empty tails are real grammar; anything
+        // Only empty or '.'-led DIGIT tails are real grammar; anything
         // else here means upstream shape drifted. FULL_ISO_RE rejects it
         // today, but the None branch below DISCARDS the residual —
         // silently emitting a clamp — so this stays loud (the Some
         // branch's junk is caught by the final gate; the clamp is not).
+        // out is still the (unmodified) input here: the message carries
+        // the whole string, grep-able like the sibling drift asserts.
         assert!(
-            residual.is_empty() || residual.starts_with('.'),
-            "EOD 24:00 residual drift: {residual:?}"
+            residual.is_empty()
+                || (residual.starts_with('.') && all_digits(residual[1..].as_bytes())),
+            "EOD 24:00 residual drift: {out:?} (tail {residual:?})"
         );
         let next = next_day(&out[..10]);
         out.clear();
@@ -381,8 +384,14 @@ fn next_day(date: &str) -> Option<String> {
 fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
     // ZEROS → NINES is a digit-for-digit swap of the MAX_FRAC-width run
-    // (width compile-time-pinned), so the shape survives by construction
-    // — no re-gate needed here.
+    // (width compile-time-pinned), so the swap itself can't drift — but
+    // the HAND-CODED offset 20 has no other net: pin the layout the
+    // splice assumes (round-19 removed the redundant full shape gate;
+    // this one line is the runtime check those findings traded).
+    assert!(
+        out.as_bytes()[19] == b'.',
+        "max_instant splice drift: {out:?}"
+    );
     out.replace_range(20.., NINES);
 }
 
