@@ -346,12 +346,35 @@ fn tz_suffixed_minute_bound_pads_to_seconds() {
 
 #[test]
 fn until_long_fraction_keeps_before_bucket() {
-    // >MAX_FRAC-digit fracs truncate to 19 first: the exclusive bound must
-    // not swallow the final sub-nanosecond bucket (9999999995 < 9.9999999999)
+    // fracs pad to MAX_FRAC: the exclusive bound must not swallow any
+    // bucket below it (.9999999995 is strictly before .9999999999)
     let path = fixture("2026-10-09T12:34:45.9999999995 event\n");
     let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "2026-10-09T12:34:45.9999999999"]);
 
-    assert!(out.contains("event"), "0.9999999995 < 0.9999999999, got: {out:?}");
+    assert!(out.contains("event"), "got: {out:?}");
+}
+
+#[test]
+fn over_max_frac_digits_truncate_and_still_order() {
+    // >MAX_FRAC run: the truncation branch (out.truncate) must keep
+    // relative order of the surviving 19 digits, not drop everything
+    let path = fixture("2026-10-09T12:34:45.9999999999999999995 event\n");
+    let out = cardio(&[
+        path.0.to_string_lossy().as_ref(),
+        "--until", "2026-10-09T12:34:45.99999999999999999999",
+    ]);
+
+    assert!(out.contains("event"), "truncated ..995 stays below the bound, got: {out:?}");
+}
+
+#[test]
+fn non_zero_offset_strips_naive() {
+    // tz-naive strips EVERY offset suffix, not only zero ones: '…13:00:00
+    // +01:00' and '…13:00:00Z'/'…13:00:00' are then the same instant
+    let path = fixture("2026-10-09T13:00:00+01:00 event\n");
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "2026-10-09T13:00:00"]);
+
+    assert!(!out.contains("event"), "naive equal instant fails the exclusive bound, got: {out:?}");
 }
 
 #[test]

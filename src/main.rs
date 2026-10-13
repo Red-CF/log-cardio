@@ -134,13 +134,20 @@ fn flush(outbuf: &mut Sink) {
     }
 }
 
-/// Exactly MAX_FRAC frac digits on every compare: equal instants compare
-/// equal and longer instants compare larger, on both line and bound side.
+/// Exactly MAX_FRAC frac digits on every compare — every instant emitted
+/// by to_canonical carries the full run, frac-less forms included (a bare
+/// "…45" is a strict prefix of "…45.000…" and would mis-order otherwise).
 /// 19 covers real (≤ nanosecond) and pathological ≤19; longer fracs
-/// truncate — ceiling: a >19-digit --until bound could drop one final
-/// bucket (compare numerically via chrono if that ever matters).
+/// truncate, so >19-digit fracs COLLAPSE: distinct instants compare equal
+/// (extra keeps on --since, one final bucket lost on --until, line-vs-line
+/// order blurs). Compare numerically via chrono if that ever matters.
 const MAX_FRAC: usize = 19;
 const ZEROS: &str = "0000000000000000000"; // MAX_FRAC zeros
+
+static TZ_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // tz suffix allowed by FULL_ISO_RE: Z or ±dd(:?dd)?
+    Regex::new(r"(?:Z|[+-]\d{2}:?\d{2})$").unwrap()
+});
 
 /// Digit run after the '.' in a fractional instant: "45.5" → Some(1),
 /// no dot → None. The run itself (length), not padability.
@@ -150,12 +157,12 @@ fn short_frac(s: &str) -> Option<usize> {
 }
 
 /// THE single canonical-for-compare writer: space→'T' (" " < "T" would
-/// mis-order), zero tz offsets (Z, ±00:00, ±0000) drop the suffix so
-/// "…45+00:00" and "…45Z" compare equal ('+' < 'Z' would mis-order),
-/// date-only = day start, minute precision — tz-suffixed or not — pads
-/// to ":00", fractions normalize to MAX_FRAC digits (zeros at the run's
-/// end, before any remaining suffix; longer fracs truncate).
-/// Lines and bounds both land here — one invariant, no drift.
+/// mis-order), the tz suffix strips whole (compare is tz-naive — a '+'
+/// or 'Z' tail itself would mis-order equal instants), date-only = day
+/// start, minute precision pads to ":00", a frac on MINUTES converts to
+/// seconds (".5" = 30s, not ":00.5"), and every instant ends with
+/// MAX_FRAC frac digits. Lines and bounds both land here — one
+/// invariant, no drift.
 fn to_canonical(s: &str, out: &mut String) {
     out.clear();
     if s.len() > 10 && s.as_bytes()[10] == b' ' {
@@ -165,55 +172,60 @@ fn to_canonical(s: &str, out: &mut String) {
     } else {
         out.push_str(s);
     }
-    // zero offsets are UTC: strip the suffix before the pad passes
-    for off in ["Z", "+00:00", "-00:00", "+0000", "-0000"] {
-        if out.ends_with(off) {
-            out.truncate(out.len() - off.len());
-            break;
-        }
+    if let Some(m) = TZ_SUFFIX_RE.find(&out) {
+        out.truncate(m.start());
     }
     if out.len() == 10 {
+        // date-only = day start (bounds: --until handles its own convention)
         out.push_str("T00:00:00");
+        out.push('.');
+        out.push_str(ZEROS);
         return;
     }
+    // "T12:34.5": FULL_ISO_RE admits a frac on MINUTES — it is fractional
+    // minutes (.5 = 30s), not sub-second: convert before the minute pad
+    // would misread it as ":00.5"
+    {
+        let b = out.as_bytes();
+        if out.len() > 16 && b[10] == b'T' && b[13] == b':' && b[16] == b'.' {
+            let run = short_frac(&out).unwrap_or(0);
+            let secs = if run > 0 && run <= 19 {
+                let num: u64 = out[17..17 + run].parse().unwrap_or(0);
+                60u64 * num / 10u64.pow(run as u32)
+            } else {
+                0
+            };
+            out.replace_range(16.., &format!(":{:02}", secs));
+        }
+    }
     // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
-    // is not the ':' that would start seconds (may be a tz suffix)
-    let needs_minute_pad = {
+    // is not the ':' that would start seconds (nothing is left after the
+    // tz strip, so a bare "HH:MM" tail is partial)
+    let minute_only = {
         let b = out.as_bytes();
         out.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':')
     };
-    if needs_minute_pad {
+    if minute_only {
         out.insert_str(16, ":00");
     }
     if let Some(i) = out.find('.') {
-        let run = short_frac(&out).unwrap();
-        // one memmove each way; recompute the dot after any ":00" insert
+        let run = out.len() - i - 1;
         if run < MAX_FRAC {
-            out.insert_str(i + 1 + run, &ZEROS[..MAX_FRAC - run]);
-        } else if run > MAX_FRAC {
-            out.drain(i + 1 + MAX_FRAC..i + 1 + run);
+            out.push_str(&ZEROS[..MAX_FRAC - run]);
+        } else {
+            out.truncate(i + 1 + MAX_FRAC);
         }
+    } else {
+        out.push('.');
+        out.push_str(ZEROS);
     }
 }
 
-/// Predicate mirroring to_canonical's transformation set — derived from the
-/// same helper calls; any new rule must land in both. Unchanged matches
-/// keep the borrowed slice (no copy on the hot path).
-fn ts_canonical_needed(s: &str) -> bool {
-    let b = s.as_bytes();
-    (s.len() > 10 && b[10] == b' ')
-    || s.len() == 10
-    // zero offsets strip to seconds; non-MAX_FRAC runs pad/truncate
-    || short_frac(s).is_some_and(|run| run != MAX_FRAC)
-    || ["Z", "+00:00", "-00:00", "+0000", "-0000"].iter().any(|o| s.ends_with(o))
-    || (s.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':'))
-}
-
-/// Normalize a matched timestamp for lexicographic compare (canonical).
+/// Normalize a matched timestamp for lexicographic compare: always
+/// canonical — every instant takes the same shape, so no fast-path
+/// predicate can drift from the writer. Writes into `buf` (reused
+/// capacity; ~20 bytes memcpy, no per-line alloc).
 fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
-    if !ts_canonical_needed(ts) {
-        return ts;
-    }
     to_canonical(ts, buf);
     buf.as_str()
 }
@@ -226,9 +238,12 @@ fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
 /// convention; offset handling stays tz-naive — chrono if that ever matters.
 fn canonical_bound(s: &str, until: bool) -> String {
     if until && s.len() == 10 {
-        // RAW date-only check: to_canonical would pad it to day start,
-        // which as an exclusive bound excludes the whole end day
-        return next_day_start(s);
+        // RAW date-only: next-day start (padding as an exclusive bound
+        // would exclude the whole end day) — then get the full shape too
+        let d = next_day_start(s);
+        let mut out = String::new();
+        to_canonical(&d, &mut out);
+        return out;
     }
     let mut out = String::new();
     to_canonical(s, &mut out);
