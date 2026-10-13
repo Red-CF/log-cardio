@@ -89,20 +89,32 @@ fn compile_regex(pattern: &str, source: &str) -> Regex {
     })
 }
 
-/// Full ISO structure: date, optional time (hh:mm(:ss)?)?, optional
-/// fractional seconds (SECONDS only — a frac on minutes is not a real
-/// log grammar and is rejected like any other invalid ts) + tz offset.
-/// ponytail: structural + calendar-sanity only — exact days-in-month
-/// and tz semantics stay out (chrono if needed).
 /// [0-9] over \d on purpose: regex \d is Unicode-aware and every byte
 /// check downstream (is_full_iso arithmetic, all_digits, truncate,
 /// shape gate) assumes ASCII digits — pinning the range retires the
-/// whole unicode-digit class at the grammar instead of netting it
-/// branch by branch.
+/// unicode-digit class at the VALIDATION grammar. Same pin applied to
+/// the default trim regex below; custom configs carrying \d re-open
+/// that leak at their own trim layer.
+/// ponytail: structural + calendar-sanity only — exact days-in-month
+/// and tz semantics stay out (chrono if needed).
+/// FRAC (built into the pattern here, matched alone in to_canonical)
+/// is the one frac-grammar home: widen it there, both widen.
 static FULL_ISO_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}([ T][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)?$")
-        .unwrap()
+    Regex::new(&format!(
+        r"^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}([ T][0-9]{{2}}:[0-9]{{2}}(?::[0-9]{{2}}(?:{FRAC})?)?(?:Z|[+-][0-9]{{2}}:?[0-9]{{2}})?)?$"
+    ))
+    .unwrap()
 });
+
+/// The frac grammar, one home: embedded in FULL_ISO_RE's seconds group
+/// above and matched alone against a line ts tail in to_canonical's EOD
+/// branch — widen it here once (comma frac, etc.) and both follow. A
+/// frac may only follow SECONDS: a frac on minutes is not a real log
+/// grammar and is rejected like any other invalid ts.
+static FRAC: &str = r"\.[0-9]+";
+/// Anchor wrapper so the EOD residual check reuses FRAC verbatim
+/// (is_match of "^" + FRAC + "$") instead of a second hand copy.
+static FRAC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("^{FRAC}$")).unwrap());
 
 fn is_full_iso(s: &str) -> bool {
     if !FULL_ISO_RE.is_match(s) {
@@ -265,22 +277,19 @@ fn to_canonical(s: &str, out: &mut String) {
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
         // Residual = tail after the "…T24:00(:00)" head: empty for the
-        // minute-precision form ("T24:00", len 16). .get() instead of a
+        // minute-precision form ("T24:00", len 16). get() instead of a
         // slice keeps that case panic-free without bounds bookkeeping —
-        // FULL_ISO_RE is [0-9]-pinned above, so the tail is ascii and
-        // all_digits below cannot panic (no multibyte net needed).
-        let residual = out.get(19..).unwrap_or("").to_string();
-        // Only empty or '.'-led digit tails are real frac grammar.
-        // ponytail: drift net, second copy of FULL_ISO_RE's frac
-        // grammar — the None clamp branch below DISCARDS the residual
+        // FULL_ISO_RE is [0-9]-pinned, so the tail is ascii and the
+        // checks below cannot panic (no multibyte net needed).
+        // split_off cuts the tail off in place: the None branch discards
+        // it and the Some branch re-pushes it verbatim, so no copy.
+        let residual = if out.len() > 19 { out.split_off(19) } else { String::new() };
+        // Only empty or frac tails are real grammar here. ponytail:
+        // drift net — the None clamp branch below DISCARDS the residual
         // silently, so this stays loud where the final gate is blind.
-        // Keep in sync if the frac grammar ever widens (comma frac
-        // etc.).
+        // The grammar itself is FRAC_RE (one home above).
         assert!(
-            residual.is_empty()
-                || (residual.len() > 1
-                    && residual.starts_with('.')
-                    && all_digits(residual[1..].as_bytes())),
+            residual.is_empty() || FRAC_RE.is_match(&residual),
             "EOD 24:00 residual drift: {out:?}"
         );
         let next = next_day(&out[..10]);
@@ -396,8 +405,12 @@ fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
     // ZEROS → NINES: digit-for-digit swap of the MAX_FRAC-width run
     // (width compile-time-pinned) over the to_canonical-gated shape —
-    // shape survives by construction, so no runtime net is added here.
+    // the swap can't produce a non-shape by construction, but this is
+    // the one bound value that reaches the per-line compare without any
+    // downstream re-gate, so the once-per-run check pins the layout
+    // replace_range(20..) hand-codes. Cost: one 39-byte scan per run.
     out.replace_range(20.., NINES);
+    assert_canonical_shape(out);
 }
 
 enum Run {
@@ -894,8 +907,13 @@ fn main() {
     let re_timestamp = compile_regex(
         config.timestamp_regex.as_deref().unwrap_or(
             // ponytail: offsets matched so trimming strips them fully; the
-            // lexicographic compare stays tz-naive — chrono if that matters
-            r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)|(\d{2}/\w{3}/\d{4}:\d{2}:\d{2}:\d{2})"
+            // lexicographic compare stays tz-naive — chrono if that matters.
+            // [0-9] over \d (same as FULL_ISO_RE): \d is Unicode-aware, so
+            // a timestamp with a fullwidth digit would match here (stripped
+            // by trim) yet fail is_full_iso — the line leaks past the
+            // range filter with its timestamp deleted. Un-pinning this
+            // grammar re-opens that verified leak.
+            r"([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)|([0-9]{2}/\w{3}/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2})"
         ),
         "config timestamp_regex",
     );
