@@ -46,34 +46,42 @@ jobs:
       - uses: codecov/codecov-action@v4
 
   release:
-    # a merge to main ships the crate when the PR bumped the version in
-    # Cargo.toml; same version merged again = nothing published
+    # a merge to main ships the crate: publish the version the PR bumped in
+    # Cargo.toml; if that version is already on crates.io (unbumped merge),
+    # bump the patch in the runner and publish that instead. Other publish
+    # failures (network, auth) still fail the job loudly.
     needs: [test, build, coverage]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # serialize: two near-simultaneous merges compete over version numbers
+    concurrency: release-crate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - id: ver
-        run: |
-          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          PUBLISHED=$(curl -sfL "https://crates.io/api/v1/crates/log-cardio/versions" | jq -r --arg v "$V" '[.[].num | select(. == $v)] | length')
-          echo "version=$V" >> "$GITHUB_OUTPUT"
-          # empty query result = registry unreachable: fail loud, don't re-publish
-          [ -n "$PUBLISHED" ] || exit 1
-          [ "$PUBLISHED" = "0" ] && echo "new=yes" >> "$GITHUB_OUTPUT" || true
       - name: cargo publish
-        if: steps.ver.outputs.new == 'yes'
+        id: pub
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          for attempt in 1 2 3; do
+            LOG=$(cargo publish 2>&1) && { echo "published=$V" >> "$GITHUB_OUTPUT"; exit 0; }
+            echo "$LOG"
+            if echo "$LOG" | grep -q "already exists on crates.io"; then
+              V="${V%.*}.$(( ${V##*.} + 1 ))"
+              sed -i "s/^version = \".*\"/version = \"$V\"/" Cargo.toml
+              echo "cargo: version merged is already published — shipping $V"
+            else
+              exit 1
+            fi
+          done
+          exit 1
       - name: tag + GitHub release
-        if: steps.ver.outputs.new == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "Red-CF"
           git config user.email "crojasfer31@gmail.com"
-          git tag "v${{ steps.ver.outputs.version }}"
-          git push origin "v${{ steps.ver.outputs.version }}"
-          gh release create "v${{ steps.ver.outputs.version }}" --generate-notes
+          git tag "v${{ steps.pub.outputs.published }}"
+          git push origin "v${{ steps.pub.outputs.published }}"
+          gh release create "v${{ steps.pub.outputs.published }}" --generate-notes
