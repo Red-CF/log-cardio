@@ -247,8 +247,6 @@ fn to_canonical(s: &str, out: &mut String) {
         out.push_str(s);
     }
     strip_tz(out);
-    // FULL_ISO_RE forbids frac-on-minutes wholesale (a frac may only
-    // follow seconds) — the gate below makes any relaxation loud anyway.
     if out.len() == 10 {
         // date-only = day start (bounds: --until handles its own convention)
         out.push_str("T00:00:00");
@@ -261,20 +259,14 @@ fn to_canonical(s: &str, out: &mut String) {
     // alone, "…T24:…" would sort after everything yet before the next
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
-        // post-strip residual after "T24:00(:00)" is a frac tail or
-        // nothing — junk bytes (regex-relaxation drift) panic loud here
-        let tail = out[19.min(out.len())..].to_string();
-        assert!(
-            tail.is_empty() || tail.starts_with('.'),
-            "EOD 24:00 residual drift: {tail:?}"
-        );
+        let residual = out[19.min(out.len())..].to_string();
         let next = next_day(&out[..10]);
         out.clear();
         match next {
             Some(d) => {
                 out.push_str(&d);
                 out.push_str("T00:00:00");
-                out.push_str(&tail);
+                out.push_str(&residual);
             }
             // 9999-12-31 end-of-day = the last instant: clamp, one shape
             None => max_instant(out),
@@ -287,6 +279,12 @@ fn to_canonical(s: &str, out: &mut String) {
         let b = out.as_bytes();
         out.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':')
     } {
+        // FULL_ISO_RE forbids frac-on-minutes (a frac may only follow
+        // seconds). The end shape gate CANNOT catch this drift: the ":00"
+        // insert below would normalize ".5 minutes" into an all-digit
+        // canonical string ("half a second"), silently mis-ordering every
+        // compare — so it panics HERE, before the pad.
+        assert!(out.len() == 16, "frac-on-minutes drift: {out:?}");
         out.insert_str(16, ":00");
     }
     if let Some(i) = out.find('.') {
@@ -372,10 +370,9 @@ fn next_day(date: &str) -> Option<String> {
 /// ponytail: derived through to_canonical so the shape has one source; the
 /// NINES const is compile-time-checked against MAX_FRAC.
 fn max_instant(out: &mut String) {
-    // gate-checked output: '.' at 19, frac at 20.. — overwrite it, no
-    // find/unreachable needed
-    to_canonical("9999-12-31T23:59:59", out);
+    to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
     out.replace_range(20.., NINES);
+    assert_canonical_shape(out); // the nines result is itself a bound
 }
 
 enum Run {
@@ -557,12 +554,16 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
 /// naming the string.
 fn assert_canonical_shape(canonical: &str) {
     let b = canonical.as_bytes();
-    let sep = [4usize, 7, 10, 13, 16, 19];
-    let seps = [b'-', b'-', b'T', b':', b':', b'.'];
+    // each byte of 0..39 covered exactly once: field slices via the one
+    // all_digits predicate, separators pinned
     let ok = b.len() == 19 + 1 + MAX_FRAC
-        && sep.iter().zip(seps).all(|(i, s)| b[*i] == s)
-        && b.iter().enumerate()
-            .all(|(i, c)| sep.contains(&i) || c.is_ascii_digit());
+        && all_digits(&b[0..4]) && b[4] == b'-'
+        && all_digits(&b[5..7]) && b[7] == b'-'
+        && all_digits(&b[8..10]) && b[10] == b'T'
+        && all_digits(&b[11..13]) && b[13] == b':'
+        && all_digits(&b[14..16]) && b[16] == b':'
+        && all_digits(&b[17..19]) && b[19] == b'.'
+        && all_digits(&b[20..]);
     assert!(ok, "canonical shape drift: {canonical:?}");
 }
 
