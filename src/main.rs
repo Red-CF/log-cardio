@@ -212,11 +212,19 @@ struct RunResult {
     dedup_inserts: usize,
 }
 
+/// Input source: byte lines (file/stdin/gcloud) or decoded bq CSV rows.
+/// csv::Reader skips the header row and handles quoted fields with
+/// embedded newlines/commas — raw --format=csv lines would corrupt them.
+enum Source {
+    Lines(Box<dyn BufRead>),
+    Rows(csv::Reader<BufReader<ChildStdout>>),
+}
+
 /// Shared per-line pipeline: read bytes → query reject → time range → trim.
 /// read_until (bytes) + lossy decode: one invalid UTF-8 byte degrades to
 /// U+FFFD on that line instead of erroring and truncating the stream.
 struct Pipeline {
-    reader: Box<dyn BufRead>,
+    source: Source,
     re_timestamp: Regex,
     re_boilerplate: Regex,
     query: Option<String>,
@@ -239,25 +247,35 @@ impl Pipeline {
     /// line number. None = end of input (on read error, read_error is set).
     fn next_trimmed(&mut self) -> Option<(usize, String)> {
         loop {
-            self.raw_buf.clear();
-            match self.reader.read_until(b'\n', &mut self.raw_buf) {
-                Ok(0) => return None,
-                Ok(_) => {}
-                Err(e) => {
-                    self.read_error = Some(e);
-                    return None;
+            let line_owned = match &mut self.source {
+                Source::Lines(r) => {
+                    self.raw_buf.clear();
+                    match r.read_until(b'\n', &mut self.raw_buf) {
+                        Ok(0) => return None,
+                        Ok(_) => {}
+                        Err(e) => {
+                            self.read_error = Some(e);
+                            return None;
+                        }
+                    }
+                    self.line_no += 1;
+                    String::from_utf8_lossy(&self.raw_buf).into_owned()
                 }
-            }
-            self.line_no += 1;
-
-            let line = String::from_utf8_lossy(&self.raw_buf);
-            let line = line.trim_end_matches(['\n', '\r']);
-
-            // gcloud entries with neither textPayload nor jsonPayload.message
-            // render as blank lines: count them so vanished records are visible
-            if self.child_tool.is_some() && line.trim().is_empty() {
-                self.empty_entries += 1;
-            }
+                Source::Rows(r) => {
+                    self.line_no += 1;
+                    match r.records().next() {
+                        // columns join with ',' so a plain row reads as CSV text
+                        Some(Ok(rec)) => rec.iter().collect::<Vec<_>>().join(","),
+                        // csv::Reader's has_headers default skips row 1.
+                        None => return None,
+                        Some(Err(e)) => {
+                            self.read_error = Some(e.into());
+                            return None;
+                        }
+                    }
+                }
+            };
+            let line = line_owned.trim_end_matches(['\n', '\r']);
 
             // Fast rejects FIRST, before any allocation
             if let Some(q) = &self.query {
@@ -291,21 +309,46 @@ impl Pipeline {
             let trimmed = self.re_timestamp.replace_all(line, "");
             let trimmed = self.re_boilerplate.replace_all(&trimmed, "");
             let final_line = trimmed.trim();
-            if final_line.is_empty() { continue; }
+            if final_line.is_empty() {
+                // A fetcher row/entry that contributes nothing: count it so
+                // vanished records are visible (gcloud blank entries, bq rows
+                // whose text column is empty). Counted late so --query rows
+                // the user didn't ask for are never tallied as losses.
+                if self.child_tool.is_some() { self.empty_entries += 1; }
+                continue;
+            }
             return Some((self.line_no, final_line.to_string()));
         }
     }
 }
 
-/// Spawn gcloud / open file / stdin — returns the reader and any child we own.
-/// gcloud mode pushes canonical time bounds into the SERVER-side filter
-/// (valid ISO by is_full_iso) to avoid downloading months of entries that
-/// local filtering would drop.
+/// Spawn a child fetcher (gcloud/bq): piped stdout, inherited stderr.
+/// Returns (raw stdout pipe, child we own for wait/kill).
+fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) {
+    let mut child = Command::new(tool)
+        .args(&argv)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
+            exit(1);
+        });
+    let stdout: ChildStdout = child.stdout.take().expect("child stdout");
+    (stdout, child)
+}
+
+/// Spawn gcloud / bq / open file / stdin. Returns the input source and any
+/// child fetcher we own. gcloud mode pushes canonical time bounds into the
+/// SERVER-side filter (valid ISO by is_full_iso) to avoid downloading months
+/// of entries that local filtering would drop.
+/// ponytail: bq mode can't push bounds — the SQL is the user's — so
+/// --since/--until filter locally; date it in the query itself.
 fn make_reader(
     args: &Args,
     since_valid: &Option<String>,
     until_valid: &Option<String>,
-) -> (Box<dyn BufRead>, Option<Child>, &'static str) {
+) -> (Source, Option<(&'static str, Child)>) {
     if let Some(filter) = &args.gcloud {
         let mut gc_filter = filter.clone();
         // bounds already canonicalized: no space separator remains
@@ -322,20 +365,11 @@ fn make_reader(
         ];
         // ponytail: no --limit pushdown for --max-lines; the early-cut kill
         // already bounds the download.
-        let mut child = Command::new("gcloud")
-            .args(&gc_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to execute gcloud: {}. Is gcloud CLI installed?", e);
-                exit(1);
-            });
-        let stdout: ChildStdout = child.stdout.take().expect("gcloud stdout");
-        (Box::new(BufReader::new(stdout)), Some(child), "gcloud")
+        let (stdout, child) = spawn_fetcher("gcloud", gc_args);
+        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("gcloud", child)))
     } else if let Some(sql) = &args.bq {
-        // ponytail: csv = one row per line for the pipeline; --max_rows
-        // pushed at 10M because bq silently caps selects at 1000 rows.
+        // --max_rows pushed at 10M because bq silently caps selects at
+        // 1000 rows; csv::Reader decodes rows (quotes, embedded newlines).
         let bq_args = vec![
             "query".to_string(),
             "--use_legacy_sql=false".to_string(),
@@ -343,25 +377,16 @@ fn make_reader(
             "--max_rows=10000000".to_string(),
             sql.clone(),
         ];
-        let mut child = Command::new("bq")
-            .args(&bq_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to execute bq: {}. Is the bq CLI installed?", e);
-                exit(1);
-            });
-        let stdout: ChildStdout = child.stdout.take().expect("bq stdout");
-        (Box::new(BufReader::new(stdout)), Some(child), "bq")
+        let (stdout, child) = spawn_fetcher("bq", bq_args);
+        (Source::Rows(csv::Reader::from_reader(BufReader::new(stdout))), Some(("bq", child)))
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {
             eprintln!("Error opening file {}: {}", path, e);
             exit(1);
         });
-        (Box::new(BufReader::new(file)), None, "")
+        (Source::Lines(Box::new(BufReader::new(file))), None)
     } else {
-        (Box::new(BufReader::new(io::stdin())), None, "")
+        (Source::Lines(Box::new(BufReader::new(io::stdin()))), None)
     }
 }
 
@@ -460,7 +485,6 @@ fn collect_sessions(
                     // auto-ref-mut binding; reuse the buffer, no per-event alloc
                     *n += 1;
                     last.clear();
-                    last.push_str(&line);
                     last.push_str(&line);
                     count += 1;
                 }
@@ -614,12 +638,12 @@ fn main() {
         .filter(|u| is_full_iso(u)).map(|u| canonical_until(u));
     let range_filter = since_valid.is_some() || until_valid.is_some();
 
-    let (reader, child, child_tool) = make_reader(&args, &since_valid, &until_valid);
-    let mut gc_child = child;
-    let child_tool = if child_tool.is_empty() { None } else { Some(child_tool) };
+    let (reader, fetched_child) = make_reader(&args, &since_valid, &until_valid);
+    let child_tool = fetched_child.as_ref().map(|(t, _)| *t);
+    let mut child = fetched_child.map(|(_, c)| c);
 
     let mut proc = Pipeline {
-        reader,
+        source: reader,
         re_timestamp,
         re_boilerplate,
         query: args.query.clone(),
@@ -740,21 +764,21 @@ fn main() {
     // ignores SIGPIPE and children inherit it, so gcloud would die on EPIPE
     // with a nonzero exit — reported as a failure we caused.
     if early_cut {
-        if let Some(child) = gc_child.as_mut() { let _ = child.kill(); }
+        if let Some(child) = child.as_mut() { let _ = child.kill(); }
     }
-    if let Some(child) = gc_child.as_mut() {
+    if let Some(child) = child.as_mut() {
         match child.wait() {
             Ok(status) if !status.success() => {
                 if early_cut {
-                    eprintln!("Note: {} stream cut early (--max-lines).", child_tool.unwrap_or("child"));
+                    eprintln!("Note: {} stream cut early (--max-lines).", child_tool.unwrap_or("fetcher"));
                 } else {
                     // Propagate: scripts piping cardio must see fetch failures
-                    eprintln!("Error: {} exited with {}", child_tool.unwrap_or("child"), status);
+                    eprintln!("Error: {} exited with {}", child_tool.unwrap_or("fetcher"), status);
                     exit(1);
                 }
             }
             Ok(_) => {}
-            Err(e) => eprintln!("Warning: failed to wait for gcloud: {}", e),
+            Err(e) => eprintln!("Warning: failed to wait for {}: {}", child_tool.unwrap_or("fetcher"), e),
         }
     }
 

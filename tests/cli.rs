@@ -210,6 +210,18 @@ fn stats_plus_summary_emits_nothing() {
 }
 
 #[test]
+fn summary_last_is_exactly_one_event() {
+    // regression: the last event must be the line alone, never doubled
+    let path = fixture(
+        "2026-10-09T12:00:00Z INFO req_42 start\n2026-10-09T12:00:01Z INFO req_42 mid\n2026-10-09T12:00:02Z INFO req_42 done\n",
+    );
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--summary", "--trace", "req_([0-9]+)"]);
+
+    assert!(out.lines().any(|l| l == "req_42 done"), "got: {out:?}");
+    assert!(!out.contains("donereq"), "got: {out:?}");
+}
+
+#[test]
 fn impossible_date_bound_is_rejected() {
     // calendar sanity: 2026-99-99 must be warned about, not silently trusted
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))

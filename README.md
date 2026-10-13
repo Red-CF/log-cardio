@@ -16,7 +16,7 @@ cargo install --path .
 cardio app.log                      # file
 tail -f app.log | cardio            # stdin
 cardio --gcloud 'resource.type=gce_instance'   # fetch straight from Cloud Logging
-cardio --bq 'SELECT text, timestamp FROM prod.traces'   # fetch via BigQuery SQL
+cardio --bq 'SELECT FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp, text FROM prod.traces'   # fetch via BigQuery SQL
 ```
 
 gcloud mode pushes `--since`/`--until` bounds into the server-side filter
@@ -24,10 +24,26 @@ gcloud mode pushes `--since`/`--until` bounds into the server-side filter
 time bounds the query streams oldest-first — bound it with `--since` (e.g. an
 ISO timestamp 7 days back) if you only need recent entries.
 
-bq mode runs `bq query --format=csv` and every result row flows through the
+bq mode runs `bq query --format=csv` and the result rows flow through the
 same pipeline (query/range/trace/summary/stats) — pull trace data with SQL
-and trim it in one step. bq's row limits still apply (cardio passes
-`--max_rows=10000000`).
+and trim it in one step. Rows are decoded as CSV (quoted fields with
+embedded commas/newlines keep a single row) and the header row is skipped.
+
+bq tips:
+
+```bash
+# TIMESTAMP columns render as "2026-10-13 12:00:00 UTC" — that leaves a
+# stray ` UTC` in the output and --since/--until can't read it. Emit ISO
+# so cardio understands it:
+cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp FROM prod.traces'
+```
+
+- `--max_rows=10000000` is passed because bq silently caps selects at
+  1000 rows otherwise.
+- `--since`/`--until` are NOT pushed into bq (the SQL is yours): filter
+  dates in the query with a `WHERE` clause over `FORMAT_TIMESTAMP(...)`
+  text, and the same ISO bounds still apply locally.
+- `--max-lines` cuts the bq process early once the cap is reached.
 
 ## Flags
 
