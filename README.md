@@ -50,6 +50,8 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | Flag | Effect |
 |---|---|
 | `[file]` | Log file. Omitted → stdin. |
+| `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
+| `[file]` | Log file. Omitted → stdin. |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
 | `--dedup` | Drop repeated whole lines (Bloom filter, ~1% false positives, memory constant). |
 | `--max-lines N` | Cap output (events in `--trace`/`--summary` mode). |

@@ -507,6 +507,19 @@ fn minute_precision_line_enters_range_filter() {
 }
 
 #[test]
+fn agent_md_prints_card() {
+    // the card must stay honest: exit 0, name the tool and the flags
+    // the agent actually needs (dedup for tokens, since/until ranges)
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .arg("--agent-md")
+        .output()
+        .expect("cardio binary should run");
+    assert!(out.status.success(), "got: {:?}", out.status);
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("# cardio") && s.contains("--dedup") && s.contains("--since"), "got: {s:?}");
+}
+
+#[test]
 fn frac_on_minutes_bound_is_rejected() {
     // a frac on minutes is no real grammar — rejected like any invalid ts
     let path = fixture("2026-10-09T12:34:30 event\n");

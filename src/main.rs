@@ -67,6 +67,11 @@ struct Args {
     /// Path to TOML config file (timestamp_regex, boilerplate_regex, default_trace)
     #[arg(long)]
     config: Option<String>,
+
+    /// Print an agent-facing markdown card (what cardio is, flags, output,
+    /// time gotchas) and exit — pipe it: `cardio --agent-md > AGENTS.md`
+    #[arg(long)]
+    agent_md: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -75,6 +80,62 @@ struct CardConfig {
     boilerplate_regex: Option<String>,
     default_trace: Option<String>,
 }
+
+/// `--agent-md`: the context card. Honest contract only — the card is
+/// static text reviewed with the flags; update alongside behavior
+/// changes.
+static AGENT_MD: &str = r#"# cardio — agent context
+
+Rust CLI that trims noise from logs so they are cheap to read as tokens.
+Streams line by line with near-constant memory (Bloom-filter dedup, capped
+maps): GB-sized inputs are fine, they never load into RAM. It can also fetch
+logs itself via `--gcloud` / `--bq`.
+
+## Why use it
+Logs are full of boilerplate lines that repeat across every entry. cardio
+strips timestamps and boilerplate tokens, filters by range, and can group
+events by ID — one pass, deterministic, streaming.
+
+## Cheatsheet
+| Command | Effect |
+|---|---|
+| `cardio app.log` | trim a file (stdin if omitted: `... \| cardio`) |
+| `--query error` | keep only lines containing TEXT (substring) |
+| `--dedup` | drop whole repeated lines (Bloom filter, ~1% false positives) |
+| `--max-lines 100` | cap output lines |
+| `--json` | NDJSON output: {"index","content"} |
+| `--since TS` | keep lines with timestamp >= TS |
+| `--until TS` | keep lines with timestamp < TS |
+| `--trace REGEX` | group lines by the captured ID, sessions at the end |
+| `--summary` | with --trace: compact per-ID map (count + first/last) |
+| `--stats` | survey to stderr (top patterns), no stream output |
+| `--gcloud FILTER` | stream Cloud Logging (since/until pushed to the server) |
+| `--bq "SQL"` | stream BigQuery rows via the bq CLI (CSV) |
+| `--config FILE`  | custom timestamp/boilerplate regexes, default_trace (TOML) |
+
+## Output shape
+Default: one line per kept event, `content` with boilerplate trimmed away.
+`--json`: {"index": <n>, "content": "..."}. `--trace` sessions: the ID and
+its event lines; `--summary`: {"id","count","first","last"}.
+
+## Timestamps — what bounds accept
+Full ISO only: `YYYY-MM-DD` alone, or with time up to `HH:MM[:SS[.frac]]`,
+optional `Z` / `±HH[MM][:MM]` offset. `--since 2026-10-01` = day start;
+`--until 2026-10-01` = NEXT day start (the end day is kept, so date-to-date
+spans behave like `>=` / `<=` on whole days). Invalid bounds exit with an
+error instead of streaming unfiltered. Line timestamps are matched inside
+the line itself (the line does not have to start with one); compares are
+tz-naive — don't mix `+02:00` logs against UTC bounds.
+
+## Gotchas
+- 25 lines of "INFO starting worker" cost 25 output lines minus dedup:
+  `--dedup` is the single biggest token saver on repetitive files.
+- A line whose timestamp doesn't match the (configurable) timestamp
+  grammar — e.g. a bare date with no time — bypasses the range filter
+  and is printed as-is; there is no warning for it today.
+- `--gcloud` mode: entries with NO payload (neither text nor json message)
+  can't be carried by the current fetch format and are counted, not printed.
+"#;
 
 #[derive(Serialize)]
 struct LogEntry {
@@ -880,6 +941,14 @@ fn emit_sessions(sessions: &BTreeMap<String, Session>, json: bool, outbuf: &mut 
 
 fn main() {
     let args = Args::parse();
+
+    // Pure-print flag, no source required — an agent meeting cardio for
+    // the first time runs this itself; keeping it a const means the card
+    // can never drift from the binary's real flags.
+    if args.agent_md {
+        print!("{AGENT_MD}");
+        exit(0);
+    }
 
     // exactly one source: file / gcloud / bq
     let sources = [
