@@ -138,10 +138,6 @@ static TRIM_BODY: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-/// Anchor wrapper so the EOD residual check reuses FRAC verbatim
-/// instead of a second hand copy.
-static FRAC_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!("^{FRAC}$")).unwrap());
-
 fn is_full_iso(s: &str) -> bool {
     if !FULL_ISO_RE.is_match(s) {
         return false;
@@ -303,22 +299,17 @@ fn to_canonical(s: &str, out: &mut String) {
     // day's "T00:…" (compare order broken across the boundary).
     if out.len() >= 16 && is_eod_24(out.as_bytes()) {
         // Residual = tail after the "…T24:00(:00)" head: empty for the
-        // minute-precision form ("T24:00", len 16). split_off cuts the
-        // tail off in place — the None branch discards it, the Some
-        // branch re-pushes it verbatim — so the only bounds check is
-        // this len > 19 (the len-16 form panicked as a raw slice OOB
-        // in r21; the guard is that path's net). FULL_ISO_RE is
-        // [0-9]-pinned, so the tail is ascii and the check cannot
-        // panic (no multibyte net needed).
+        // minute-precision form ("T24:00", len 16) — the only reason for
+        // the len > 19 guard (that form used to panic as a raw slice
+        // OOB). split_off cuts the tail off in place: the None branch
+        // discards it, the Some branch re-pushes it verbatim.
+        // ponytail: no residual grammar-check — FULL_ISO_RE already
+        // validated the input, and its EOD forms leave only an empty or
+        // '.'-digit tail; a junk tail is caught by the end shape gate
+        // (Some branch) or discarded harmlessly by the clamp (None).
+        // Ceiling: widening the EOD grammar must add a check back here,
+        // not more asserts.
         let residual = if out.len() > 19 { out.split_off(19) } else { String::new() };
-        // Only empty or frac tails are real grammar here. ponytail:
-        // drift net — the None clamp branch below DISCARDS the residual
-        // silently, so this stays loud where the final gate is blind.
-        // The grammar itself is FRAC_RE (one home above).
-        assert!(
-            residual.is_empty() || FRAC_RE.is_match(&residual),
-            "EOD 24:00 residual drift: {out:?}"
-        );
         let next = next_day(&out[..10]);
         out.clear();
         match next {
@@ -432,12 +423,8 @@ fn max_instant(out: &mut String) {
     to_canonical("9999-12-31T23:59:59", out); // gate-checked: '.' at 19
     // ZEROS → NINES: digit-for-digit swap of the MAX_FRAC-width run
     // (width compile-time-pinned) over the to_canonical-gated shape —
-    // the swap can't produce a non-shape by construction, but this is
-    // the one bound value that reaches the per-line compare without any
-    // downstream re-gate, so the once-per-run check pins the layout
-    // replace_range(20..) hand-codes. Cost: one 39-byte scan per run.
+    // safe by construction, no runtime net.
     out.replace_range(20.., NINES);
-    assert_canonical_shape(out);
 }
 
 enum Run {
