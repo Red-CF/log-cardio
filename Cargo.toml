@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Trim the fat from logs for LLM agents: lean default pipeline (trim + dedup + cap), direct gcloud/bq streaming, trace grouping and surveys — GBs in, tokens out."
 license = "MIT"
+repository = "https://github.com/Red-CF/log-cardio"
 
 # crate name is log-cardio (cardio was taken on crates.io); the installed
 # binary keeps the product name.

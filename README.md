@@ -1,5 +1,7 @@
 # cardio
 
+[![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
+
 Fast Rust CLI that trims the fat from logs — fewer tokens for LLM agents.
 Logs can be GBs: cardio streams line by line with near-constant memory
 (Bloom-filter dedup, capped stats/trace maps). Agents can fetch logs
