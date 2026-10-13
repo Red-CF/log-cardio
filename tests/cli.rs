@@ -222,6 +222,57 @@ fn summary_last_is_exactly_one_event() {
 }
 
 #[test]
+fn bq_csv_rows_are_clean_events() {
+    // fake bq on PATH: header row, quoted comma field, empty-text row.
+    // Regression: comma join left ",..." residue + the empty row as phantom ","
+    let fake = std::env::temp_dir()
+        .join(format!("cardio_fakebin_{}", std::process::id()));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join("bq");
+    std::fs::write(&script, "#!/bin/sh\ncat <<'CSV'\ntimestamp,text\n2026-10-13T12:00:00Z,\"req_1 login, ok\"\n2026-10-13T12:00:02Z,\nCSV\n")
+        .expect("write fake bq");
+    let _ = Command::new("chmod").arg("+x").arg(&script).status();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT timestamp, text FROM t", "--json"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    assert!(
+        out.status.success(),
+        "cardio exited {}: stderr: {:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(), 1,
+        "header + empty-text row must not be events: {stdout:?}"
+    );
+    let v: serde_json::Value = serde_json::from_str(lines[0])
+        .unwrap_or_else(|e| panic!("line must be JSON: {e}"));
+    assert_eq!(v["content"], "req_1 login, ok", "no separator residue: {stdout:?}");
+}
+
+#[test]
+fn date_only_ts_passes_its_own_since_day() {
+    // a date-only line ts is a strict prefix of the canonical bound 'YYYY-
+    // MM-DDT00:00:00' — it must compare as that day's start, not get dropped
+    let cfg = fixture("timestamp_regex = '\\d{4}-\\d{2}-\\d{2}'\n");
+    let path = fixture("2026-10-09 boot\n2026-10-10 later\n");
+    let out = cardio(&[
+        "--config", cfg.0.to_string_lossy().as_ref(),
+        "--since", "2026-10-09T00:00:00",
+        "--until", "2026-10-10T00:00:00",
+        path.0.to_string_lossy().as_ref(),
+    ]);
+
+    assert!(out.contains("boot"), "same-day line must pass --since, got: {out:?}");
+    assert!(!out.contains("later"), "got: {out:?}");
+}
+
+#[test]
 fn impossible_date_bound_is_rejected() {
     // calendar sanity: 2026-99-99 must be warned about, not silently trusted
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))

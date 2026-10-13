@@ -134,11 +134,18 @@ fn flush(outbuf: &mut Sink) {
     }
 }
 
-/// Normalize "YYYY-MM-DD HH:MM:SS" to "T" separator so lexicographic compare
-/// against a "T"-separated bound keeps time order (' ' < 'T' would mis-order).
+/// Normalize a matched timestamp for lexicographic compare against the
+/// "T"-separated bounds: "YYYY-MM-DD HH:MM:SS" grows a 'T' (" " < "T" would
+/// mis-order), and a date-only match becomes that day's start (else it's a
+/// strict prefix and compares below every same-day bound).
 /// Result is written into `buf` (reused per iteration) and returned as &str.
 fn normalize_iso<'a>(ts: &'a str, buf: &'a mut String) -> &'a str {
-    if ts.len() > 10 && ts.as_bytes()[10] == b' ' {
+    if ts.len() == 10 {
+        buf.clear();
+        buf.push_str(ts);
+        buf.push_str("T00:00:00");
+        buf.as_str()
+    } else if ts.len() > 10 && ts.as_bytes()[10] == b' ' {
         buf.clear();
         buf.push_str(&ts[..10]);
         buf.push('T');
@@ -244,10 +251,11 @@ struct Pipeline {
 
 impl Pipeline {
     /// Next line that survives query + time range + trim, with its input
-    /// line number. None = end of input (on read error, read_error is set).
+    /// line number (for Source::Rows: record number — the header row is
+    /// skipped). None = end of input (on read error, read_error is set).
     fn next_trimmed(&mut self) -> Option<(usize, String)> {
         loop {
-            let line_owned = match &mut self.source {
+            let line_cow = match &mut self.source {
                 Source::Lines(r) => {
                     self.raw_buf.clear();
                     match r.read_until(b'\n', &mut self.raw_buf) {
@@ -259,23 +267,34 @@ impl Pipeline {
                         }
                     }
                     self.line_no += 1;
-                    String::from_utf8_lossy(&self.raw_buf).into_owned()
+                    String::from_utf8_lossy(&self.raw_buf)
                 }
-                Source::Rows(r) => {
-                    self.line_no += 1;
-                    match r.records().next() {
-                        // columns join with ',' so a plain row reads as CSV text
-                        Some(Ok(rec)) => rec.iter().collect::<Vec<_>>().join(","),
-                        // csv::Reader's has_headers default skips row 1.
-                        None => return None,
-                        Some(Err(e)) => {
-                            self.read_error = Some(e.into());
-                            return None;
+                Source::Rows(r) => match r.byte_records().next() {
+                    Some(Ok(rec)) => {
+                        self.line_no += 1;
+                        // Columns join with ' ' (trim drops it): stripping the
+                        // timestamp column leaves no separator residue, and a
+                        // row that trims to nothing counts as an empty entry.
+                        let mut line = String::new();
+                        for (i, f) in rec.iter().enumerate() {
+                            if i > 0 { line.push(' '); }
+                            line.push_str(&String::from_utf8_lossy(f));
                         }
+                        // one-line-per-event contract for the join too
+                        if line.contains('\n') {
+                            line = line.replace('\n', " ");
+                        }
+                        std::borrow::Cow::Owned(line)
                     }
-                }
+                    // header row (row 1) is skipped by the csv reader.
+                    None => return None,
+                    Some(Err(e)) => {
+                        self.read_error = Some(e.into());
+                        return None;
+                    }
+                },
             };
-            let line = line_owned.trim_end_matches(['\n', '\r']);
+            let line = line_cow.trim_end_matches(['\n', '\r']);
 
             // Fast rejects FIRST, before any allocation
             if let Some(q) = &self.query {
@@ -378,7 +397,12 @@ fn make_reader(
             sql.clone(),
         ];
         let (stdout, child) = spawn_fetcher("bq", bq_args);
-        (Source::Rows(csv::Reader::from_reader(BufReader::new(stdout))), Some(("bq", child)))
+        let rows = csv::ReaderBuilder::new()
+            // ponytail: a ragged row is tolerated (read_error stays silent
+            // for it only if it parses; flexible avoids aborting the run)
+            .flexible(true)
+            .from_reader(BufReader::new(stdout));
+        (Source::Rows(rows), Some(("bq", child)))
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {
             eprintln!("Error opening file {}: {}", path, e);
