@@ -44,3 +44,34 @@ jobs:
       - run: cargo install cargo-llvm-cov
       - run: cargo llvm-cov --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
+
+  release:
+    # a merge to main ships the crate when the PR bumped the version in
+    # Cargo.toml; same version merged again = nothing published
+    needs: [test, build, coverage]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: ver
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          PUBLISHED=$(curl -sfL https://crates.io/api/v1/crates/log-cardio | jq -r .crate.max_version)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          [ "$V" != "$PUBLISHED" ] && echo "new=yes" >> "$GITHUB_OUTPUT" || true
+      - name: cargo publish
+        if: steps.ver.outputs.new == 'yes'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+      - name: tag + GitHub release
+        if: steps.ver.outputs.new == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "Red-CF"
+          git config user.email "crojasfer31@gmail.com"
+          git tag "v${{ steps.ver.outputs.version }}"
+          git push origin "v${{ steps.ver.outputs.version }}"
+          gh release create "v${{ steps.ver.outputs.version }}" --generate-notes
