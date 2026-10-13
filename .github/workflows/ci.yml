@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    # the tool claims platform independence (file/stdin sources) and
+    # spawns gcloud/bq CLIs — contract needs a real run on all three
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test
+        # network-fetching tests are faked via PATH stubs (cfg(unix)) so
+        # this works offline everywhere
+      - run: cargo build --release
+        # release build is what users install — must stay clean on all OSes
