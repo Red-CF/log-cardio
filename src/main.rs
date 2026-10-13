@@ -460,6 +460,7 @@ struct RunResult {
     sessions_capped: bool,
     session_lines_capped: bool,
     dedup_inserts: usize,
+    dropped_dups: usize,
 }
 
 /// Input source: byte lines (file/stdin/gcloud) or decoded bq CSV rows.
@@ -723,15 +724,17 @@ fn make_reader(
     }
 }
 
-/// Stream mode: dedup + emit as we go; returns dedup insertions.
+/// Stream mode: dedup + emit as we go; returns (dedup insertions,
+/// dropped-suspect-duplicate lines) — the honest stderr signal below.
 fn run_stream(
     proc: &mut Pipeline,
     mut bloom: Option<&mut Bloom<String>>,
     args: &Args,
     outbuf: &mut Sink,
-) -> usize {
+) -> (usize, usize) {
     let mut count = 0usize;
     let mut dedup_inserts = 0usize;
+    let mut dropped_dups = 0usize;
     while let Some((line_no, line)) = proc.next_trimmed() {
         if let Some(max) = args.max_lines {
             if count >= max {
@@ -741,7 +744,10 @@ fn run_stream(
         }
         if let Some(ref mut b) = bloom {
             // single probe: check + insert in one hash pass
-            if b.check_and_set(&line) { continue; }
+            if b.check_and_set(&line) {
+                dropped_dups += 1;
+                continue;
+            }
             // Track actual insertions: saturating past capacity = silent data loss
             dedup_inserts += 1;
         }
@@ -757,7 +763,7 @@ fn run_stream(
         }
         count += 1;
     }
-    dedup_inserts
+    (dedup_inserts, dropped_dups)
 }
 
 /// Stats mode: survey the whole file; returns counts + whether capped.
@@ -1034,6 +1040,7 @@ fn main() {
                 sessions_capped: false,
                 session_lines_capped: false,
                 dedup_inserts: 0,
+                dropped_dups: 0,
             }
         }
         Run::Sessions => {
@@ -1046,10 +1053,11 @@ fn main() {
                 sessions_capped,
                 session_lines_capped,
                 dedup_inserts: 0,
+                dropped_dups: 0,
             }
         }
         Run::Stream => {
-            let dedup_inserts = run_stream(&mut proc, bloom.as_mut(), &args, &mut outbuf);
+            let (dedup_inserts, dropped_dups) = run_stream(&mut proc, bloom.as_mut(), &args, &mut outbuf);
             RunResult {
                 stats_map: None,
                 sessions: None,
@@ -1057,6 +1065,7 @@ fn main() {
                 sessions_capped: false,
                 session_lines_capped: false,
                 dedup_inserts,
+                dropped_dups,
             }
         }
     };
@@ -1074,6 +1083,19 @@ fn main() {
 
     flush(&mut outbuf);
 
+    // Honest stderr signals: the default pipeline drops and caps, so the
+    // agent (or the person reading the log) must SEE exactly what was
+    // given up — never silently.
+    if result.dropped_dups > 0 {
+        eprintln!(
+            "Note: dedup dropped {} duplicate-suspect line{} (a few may actually be unique — --raw keeps everything).",
+            result.dropped_dups,
+            if result.dropped_dups == 1 { "" } else { "s" }
+        );
+    }
+    if early_cut {
+        eprintln!("Note: output stopped at the --max-lines cap; the rest of the input was not read (--raw removes the cap).");
+    }
     if result.dedup_inserts > 10_000_000 {
         eprintln!("Warning: --dedup exceeded 10M unique lines; bloom filter is saturated and unique lines may be dropped as false duplicates.");
     }
@@ -1133,7 +1155,8 @@ fn main() {
         match child.wait() {
             Ok(status) if !status.success() => {
                 if early_cut {
-                    eprintln!("Note: {} stream cut early (--max-lines).", child_tool.unwrap_or("fetcher"));
+                    // already reported above; ignore the failure we caused
+                    // (EPIPE from killing the fetcher)
                 } else {
                     // Propagate: scripts piping cardio must see fetch failures
                     eprintln!("Error: {} exited with {}", child_tool.unwrap_or("fetcher"), status);

@@ -552,6 +552,32 @@ fn default_pipeline_dedups_and_caps_raw_skips_it() {
 }
 
 #[test]
+fn lean_signals_what_it_dropped() {
+    // the default pipeline never drops silently: stderr must say how
+    // many suspect duplicates were removed and that the cap cut the run
+    let path = fixture("2026-10-09T12:00:00 dup\n2026-10-09T12:00:01 dup\n2026-10-09T12:00:02 keep\n");
+    let p = path.0.to_string_lossy().into_owned();
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args([&p])
+        .output()
+        .expect("cardio binary should run");
+    assert!(out.status.success(), "got: {:?}", out.status);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("dedup dropped 1 duplicate-suspect line"), "got: {err:?}");
+    assert!(!err.contains("--max-lines cap"), "no cap in a short run: {err:?}");
+
+    let big: String = (0..2001).map(|i| format!("2026-10-09T12:{:02}:{:02} u{i:04}\n", i / 60, i % 60)).collect();
+    let path = fixture(&big);
+    let p = path.0.to_string_lossy().into_owned();
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args([&p])
+        .output()
+        .expect("cardio binary should run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--max-lines cap"), "cap signal missing: {err:?}");
+}
+
+#[test]
 fn stats_json_emits_patterns_on_stdout() {
     let path = fixture("2026-10-09T12:00:00 alpha\n2026-10-09T12:00:01 beta\n2026-10-09T12:00:02 alpha\n");
     let p = path.0.to_string_lossy().into_owned();

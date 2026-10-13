@@ -21,6 +21,15 @@ cardio --bq 'SELECT text AS log FROM prod.traces'
 output capped at 2000 lines (`--max-lines N` overrides). No flags needed —
 this is the mode that keeps your context spend low.
 
+**⚠ Default mode drops lines.** Two ways, both deliberate: duplicated
+whole lines are removed (Bloom filter, **~1% false positives — a UNIQUE
+line can be discarded as if repeated**), and output stops at 2000 lines.
+Correct trade for trimming noise, data loss when you're hunting one
+weird event. cardio never hides it: stderr says how many were dropped
+and that the cap cut the run. When any line might be THE answer:
+`--raw` (nothing dropped, nothing capped), or narrow with `--query`
+to read everything you kept.
+
 ## Flags
 
 | Flag | Effect |
@@ -37,14 +46,6 @@ this is the mode that keeps your context spend low.
 | `--gcloud FILTER` | stream Cloud Logging (--since/--until pushed server-side) |
 | `--bq "SQL"` | stream BigQuery rows via the bq CLI (CSV) |
 | `--config FILE` | custom timestamp/boilerplate regexes, default_trace (TOML) |
-
-**⚠ Default mode drops lines.** Two ways, both deliberate: duplicated
-whole lines are removed (Bloom filter, **~1% false positives — a UNIQUE
-line can be discarded as if repeated**), and output stops at 2000 lines.
-Correct trade for trimming noise, data loss when you're hunting one
-weird event. When any line might be THE answer: `--raw` (nothing
-dropped, nothing capped), or narrow with `--query` to read everything
-you kept.
 
 ## Output shape
 Default: one line per kept event, boilerplate trimmed away.
