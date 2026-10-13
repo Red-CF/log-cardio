@@ -450,7 +450,7 @@ fn impossible_date_bound_is_rejected() {
 fn out_of_range_time_bound_is_rejected() {
     // hour/minute sanity: T99:99:99 would mis-order locally and be
     // unembeddable server-side — fail fast like a bad date
-    for b in ["2026-10-09T99:99:99", "2026-10-09T12:99:00", "2026-10-09T24:00:00"] {
+    for b in ["2026-10-09T99:99:99", "2026-10-09T12:99:00"] {
         let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
             .args(["--since", b])
             .output()
@@ -459,6 +459,24 @@ fn out_of_range_time_bound_is_rejected() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("not a full ISO"), "{b}: got: {err:?}");
     }
+}
+
+#[test]
+fn iso_end_of_day_24_00_compares_as_next_day() {
+    // T24:00:00 is legal ISO (end of day) and must canonicalize to the
+    // next day's 00:00 — left alone it would sort after everything while
+    // sitting before the next day's instants
+    let path = fixture("2026-10-09T20:00:00Z early\n2026-10-09T24:00:00Z boot\n");
+    let p = path.0.to_string_lossy().into_owned();
+
+    let kept = cardio(&["--since", "2026-10-09T20:00:00", &p]);
+    assert!(kept.contains("boot") && kept.contains("early"), "got: {kept:?}");
+
+    // boot == next-day 00:00 == the exclusive until exactly, so it drops;
+    // early's instant is strictly before
+    let dropped = cardio(&["--until", "2026-10-10T00:00:00", &p]);
+    assert!(dropped.contains("early"), "got: {dropped:?}");
+    assert!(!dropped.contains("boot"), "24:00 == next-day 00:00 instant, got: {dropped:?}");
 }
 
 #[test]
@@ -510,72 +528,61 @@ fn over_max_frac_line_collapses_to_max_shape() {
     );
 }
 
+/// Run cardio with a fake `gcloud` on PATH that echoes its FILTER arg
+/// (3rd positional, after `logging read`) to STDERR — cardio's stdout
+/// would trim the ts out of it via the normal pipeline. Asserts exit
+/// status; unique fakebin dir, removed before returning.
 #[cfg(unix)]
-#[test]
-fn gcloud_filter_embeds_plain_seconds() {
-    // the server literal must strip the canonical 19-digit pad ('…T00:
-    // 00:00', no frac tail) instead of betting the fetch on its parser
+fn fake_gcloud(args: &[&str]) -> String {
     let fake = std::env::temp_dir().join(format!(
         "cardio_fakegc_{}",
         FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&fake).expect("mkdir fakebin");
     let script = fake.join("gcloud");
-    std::fs::write(&script, "#!/bin/sh\necho \"$3\" >&2\n") // argv: logging read FILTER
+    std::fs::write(&script, "#!/bin/sh\necho \"$3\" >&2\n")
         .expect("write fake gcloud");
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
         .expect("make fake gcloud executable");
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(["--gcloud", "resource.type=x", "--since", "2026-10-09", "--until", "2026-10-09T12:34:45.5"])
+        .args(args)
         .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
         .output()
         .expect("cardio binary should run");
     std::fs::remove_dir_all(&fake).ok();
     assert!(
         out.status.success(),
-        "stderr: {:?}",
+        "cardio exited {}: stderr: {:?}",
+        out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    // the echo lands on the fake's stderr: cardio's stdout would have the
-    // ts trimmed out of it by the normal pipeline
-    let echo = String::from_utf8_lossy(&out.stderr);
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[cfg(unix)]
+#[test]
+fn gcloud_filter_embeds_plain_seconds() {
+    // pushdown is second-precision: since >= its floor second, until <
+    // the NEXT second (a <= floor literal would exclude (floor, frac)
+    // entries the local filter keeps — "…45" means instant 45.0, not the
+    // second). No frac shape ever reaches the fetcher.
+    let echo = fake_gcloud(&[
+        "--gcloud", "resource.type=x", "--since", "2026-10-09", "--until", "2026-10-09T12:34:45.5",
+    ]);
     assert!(echo.contains("timestamp>=\"2026-10-09T00:00:00\""), "got: {echo:?}");
-    assert!(echo.contains("timestamp<=\"2026-10-09T12:34:45\""), "until embeds <= its floor second");
-    assert!(!echo.contains("0000000000"), "bare 19-digit pad leaked to the server: {echo:?}");
+    assert!(echo.contains("timestamp<\"2026-10-09T12:34:46\""), "until embeds < next second");
+    assert!(!echo.contains("=0000000000"), "bare 19-digit pad leaked to the server: {echo:?}");
     assert!(!echo.contains(".5\""), "frac leaked to the server literal: {echo:?}");
 }
 
 #[cfg(unix)]
 #[test]
-fn gcloud_last_year_bounds_embed_valid_literal() {
-    // the 9999 clamp must stay an RFC3339-valid literal server-side, not
-    // leak the internal sentinel shape
-    let fake = std::env::temp_dir().join(format!(
-        "cardio_fakegc2_{}",
-        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    let script = fake.join("gcloud");
-    std::fs::write(&script, "#!/bin/sh\necho \"$3\" >&2\n") // argv: logging read FILTER
-        .expect("write fake gcloud");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake gcloud executable");
-    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(["--gcloud", "resource.type=x", "--until", "9999-12-31"])
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
-        .output()
-        .expect("cardio binary should run");
-    std::fs::remove_dir_all(&fake).ok();
-    assert!(
-        out.status.success(),
-        "stderr: {:?}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let echo = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        echo.contains("timestamp<=\"9999-12-31T23:59:59\""),
-        "clamped until embeds valid literal, got: {echo:?}"
-    );
+fn gcloud_last_year_until_skips_embed() {
+    // past 9999-12-31 there is no next second: the until clause is
+    // dropped server-side and the local exact filter bounds the stream
+    let echo = fake_gcloud(&["--gcloud", "resource.type=x", "--until", "9999-12-31"]);
+
+    assert!(echo.contains("resource.type=x"), "got: {echo:?}");
+    assert!(!echo.contains("timestamp<"), "no next second -> no until embed, got: {echo:?}");
 }

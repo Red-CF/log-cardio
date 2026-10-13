@@ -117,11 +117,23 @@ fn is_full_iso(s: &str) -> bool {
         // offset/UTC suffix starts at/before byte 13 as ':'; if bytes 11-15
         // are HH:MM then any tz tail begins after byte 16
         let h = ((b[11] - b'0') as u32) * 10 + (b[12] - b'0') as u32;
-        if !(0..=23).contains(&h) {
+        if h > 24 {
             return false;
         }
+        if h == 24 {
+            // ISO 8601 allows exactly 24:00(:00) as end-of-day; anything
+            // else past 23 is bogus. Leap seconds (…:60) are rejected: the
+            // line bypasses the range filter with the usual one-shot
+            // warning — ponytail ceiling, a leap table is out of scope.
+            if b[14] != b'0' || b[15] != b'0' {
+                return false;
+            }
+            if b.len() >= 19 && b[16] == b':' && (b[17] != b'0' || b[18] != b'0') {
+                return false;
+            }
+        }
         let mi = ((b[14] - b'0') as u32) * 10 + (b[15] - b'0') as u32;
-        if !(0..=59).contains(&mi) {
+        if h <= 23 && !(0..=59).contains(&mi) {
             return false;
         }
         if b.len() >= 19 && b[16] == b':' {
@@ -218,6 +230,20 @@ fn to_canonical(s: &str, out: &mut String) {
         out.push_str(ZEROS);
         return;
     }
+    // ISO 8601 end-of-day "T24:00(:00)" = the NEXT day's 00:00:00 — left
+    // alone, "…T24:…" would sort after everything yet before the next
+    // day's "T00:…" (compare order broken across the boundary). Any
+    // residual frac tail is preserved and padded below.
+    let b = out.as_bytes();
+    if out.len() >= 16 && b[11] == b'2' && b[12] == b'4' && b[13] == b':' && b[14] == b'0' && b[15] == b'0' {
+        let canon = match next_day_start(&out[..10]) {
+            Some(d) => format!("{}{}", d, &out[19.min(out.len())..]),
+            // 9999-12-31 end-of-day = the last instant: clamp, one shape
+            None => "9999-12-31T23:59:59.".to_string() + ZEROS,
+        };
+        out.clear();
+        out.push_str(&canon);
+    }
     // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
     // is not the ':' that would start seconds (nothing is left after the
     // tz strip, so a bare "HH:MM" tail is partial)
@@ -265,7 +291,9 @@ fn canonical_bound(s: &str, until: bool) -> String {
         let mut out = String::new();
         match next_day_start(s) {
             Some(d) => to_canonical(&d, &mut out),
-            None => out.push_str(MAX_INSTANT),
+            // derive the clamp from to_canonical itself — one source of
+            // shape (a hand-built const would drift on MAX_FRAC changes)
+            None => to_canonical("9999-12-31T23:59:59", &mut out),
         }
         return out;
     }
@@ -273,10 +301,6 @@ fn canonical_bound(s: &str, until: bool) -> String {
     to_canonical(s, &mut out);
     out
 }
-
-/// The last canonical instant (9999-12-31 end): the clamp for --until when
-/// no next day exists — keeps the whole end day, embeds as a valid literal.
-const MAX_INSTANT: &str = "9999-12-31T23:59:59.9999999999999999999";
 
 /// One date increment, no chrono: manual month/leap arithmetic. None when
 /// there is no next day (9999-12-31).
@@ -478,12 +502,32 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
     (stdout, child)
 }
 
-/// Server-filter literal: plain seconds — drop the canonical frac pad
-/// whole. since >= on the floor second is fine (sub-second extras are
-/// dropped locally); until embeds <= on the SAME floor second so everything
-/// the local `<` keeps is returned server-side.
+/// Server-pushdown literal for an --until bound: `<` one second past the
+/// bound's floor second. (`<=` the floor second would EXCLUDE (floor, frac)
+/// entries the local filter keeps — a plain "…45" literal is instant 45.0,
+/// not the whole second.) None past 9999-12-31T23:59:59 (no next second —
+/// the embed is dropped; the local exact filter still bounds the stream).
+fn until_server_bound(canonical: &str) -> Option<String> {
+    let dot = canonical.find('.')?;
+    let mut date = canonical[..10].to_string();
+    let mut h: u32 = canonical[11..13].parse().ok()?;
+    let mut m: u32 = canonical[14..16].parse().ok()?;
+    let mut s: u32 = canonical[17..19].parse().ok()?;
+    s += 1;
+    if s == 60 { s = 0; m += 1; }
+    if m == 60 { m = 0; h += 1; }
+    if h == 24 {
+        h = 0;
+        date = next_day_start(&date)?;
+    }
+    Some(format!("{}T{:02}:{:02}:{:02}", date, h, m, s))
+}
+
+/// since-pushdown literal: the bound's floor second — entries from it on
+/// are fetched, sub-second extras before the exact local filter's cut are
+/// dropped locally.
 /// ponytail: second-precision pushdown, no frac at all — GCP parser risk
-/// gone; nanosecond pushdown if narrowing ever needs to go finer.
+/// gone; finer narrowing if the fetch ever needs it.
 fn server_ts(canonical: &str) -> &str {
     match canonical.find('.') {
         Some(i) => &canonical[..i],
@@ -504,14 +548,19 @@ fn make_reader(
 ) -> (Source, Option<(&'static str, Child)>) {
     if let Some(filter) = &args.gcloud {
         let mut gc_filter = filter.clone();
-        // bounds already canonicalized: no space separator remains; the
-        // embed is plain seconds (server_ts) — until is <= its floor second
-        // so the local exact filter never misses a kept entry
+        // bounds already canonicalized: no space separator remains. Pushdown
+        // is second-precision (server_ts / until_server_bound): since >= its
+        // floor second, until < its next second — the local exact filter
+        // trims whatever the wider fetch returns. Comments claim nothing
+        // about RFC 3339: these are plain gcloud timestamp literals (no
+        // offset), the shape this pushdown has carried since it existed.
         if let Some(s) = since_valid {
             gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", server_ts(s)));
         }
-        if let Some(u) = until_valid {
-            gc_filter.push_str(&format!(" AND timestamp<=\"{}\"", server_ts(u)));
+        // until: < its next second; None (past 9999-12-31) = no server
+        // clause, the local exact filter still bounds the stream
+        if let Some(next) = until_valid.as_ref().and_then(|u| until_server_bound(u)) {
+            gc_filter.push_str(&format!(" AND timestamp<\"{}\"", next));
         }
         let gc_args = vec![
             "logging".to_string(), "read".to_string(), gc_filter,
