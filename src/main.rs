@@ -7,6 +7,11 @@ use bloomfilter::Bloom;
 use clap::Parser;
 use serde::{Serialize, Deserialize};
 use std::sync::LazyLock;
+
+const MAX_STATS_PATTERNS: usize = 100_000;
+const MAX_TRACE_SESSIONS: usize = 10_000;
+const MAX_LINES_PER_SESSION: usize = 1_000;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Trim noise from logs for LLM processing")]
 struct Args {
@@ -114,6 +119,16 @@ fn emit<W: Write>(w: &mut W, text: &str) {
     }
 }
 
+/// Output sink shared by the mode runners.
+type Sink<'w> = BufWriter<&'w mut io::StdoutLock<'static>>;
+
+fn flush(outbuf: &mut Sink) {
+    if let Err(e) = outbuf.flush() {
+        on_write_err(e, "flushing output");
+        exit(1);
+    }
+}
+
 /// Normalize "YYYY-MM-DD HH:MM:SS" to "T" separator so lexicographic compare
 /// against a "T"-separated bound keeps time order (' ' < 'T' would mis-order).
 /// Result is written into `buf` (reused per iteration) and returned as &str.
@@ -165,6 +180,323 @@ fn next_day_start(date: &str) -> String {
     format!("{:04}-{:02}-{:02}T00:00:00", y, m, d)
 }
 
+enum Run {
+    /// survey: pattern frequencies to stderr, no stream output
+    Stats,
+    /// group by ID: full sessions or the compact --summary map
+    Sessions,
+    /// plain one-line-per-event stream
+    Stream,
+}
+
+/// Trace/summary share collection and emission; the variant only changes what
+/// a session keeps. BTreeMap = stable, reproducible order across runs.
+enum Session {
+    /// full trace: every event line of the session
+    Full(Vec<String>),
+    /// summary: event count, first event, last event — IDs always preserved
+    Summary(usize, String, String),
+}
+
+struct RunResult {
+    stats_map: Option<HashMap<String, usize>>,
+    sessions: Option<BTreeMap<String, Session>>,
+    stats_capped: bool,
+    sessions_capped: bool,
+    session_lines_capped: bool,
+    dedup_inserts: usize,
+}
+
+/// Shared per-line pipeline: read bytes → query reject → time range → trim.
+/// read_until (bytes) + lossy decode: one invalid UTF-8 byte degrades to
+/// U+FFFD on that line instead of erroring and truncating the stream.
+struct Pipeline {
+    reader: Box<dyn BufRead>,
+    re_timestamp: Regex,
+    re_boilerplate: Regex,
+    query: Option<String>,
+    since_valid: Option<String>,
+    until_valid: Option<String>,
+    range_filter: bool,
+    gc: bool,
+    ts_norm: String,
+    warned_non_iso: bool,
+    read_error: Option<io::Error>,
+    early_cut: bool,
+    empty_entries: usize,
+    line_no: usize,
+    raw_buf: Vec<u8>,
+}
+
+impl Pipeline {
+    /// Next line that survives query + time range + trim, with its input
+    /// line number. None = end of input (on read error, read_error is set).
+    fn next_trimmed(&mut self) -> Option<(usize, String)> {
+        loop {
+            self.raw_buf.clear();
+            match self.reader.read_until(b'\n', &mut self.raw_buf) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(e) => {
+                    self.read_error = Some(e);
+                    return None;
+                }
+            }
+            self.line_no += 1;
+
+            let line = String::from_utf8_lossy(&self.raw_buf);
+            let line = line.trim_end_matches(['\n', '\r']);
+
+            // gcloud entries with neither textPayload nor jsonPayload.message
+            // render as blank lines: count them so vanished records are visible
+            if self.gc && line.trim().is_empty() {
+                self.empty_entries += 1;
+            }
+
+            // Fast rejects FIRST, before any allocation
+            if let Some(q) = &self.query {
+                if !line.contains(q) { continue; }
+            }
+
+            // Time range: the line's FIRST timestamp match, wherever it sits
+            // (brackets/level prefixes are common), and it must be ISO —
+            // Apache format ("09/Oct/2026:...") also matches but sorts
+            // backwards lexicographically. ponytail: ts fields come first in
+            // real formats, so first-match is the intended ts; ISO strings
+            // sort chronologically and space separators normalize to 'T'.
+            if self.range_filter {
+                let lead = self.re_timestamp.find(line)
+                    .filter(|m| is_full_iso(m.as_str()))
+                    .map(|m| m.as_str());
+                if let Some(ts) = lead {
+                    let ts = normalize_iso(ts, &mut self.ts_norm);
+                    if let Some(s) = &self.since_valid {
+                        if ts < s.as_str() { continue; }
+                    }
+                    if let Some(u) = &self.until_valid {
+                        if ts >= u.as_str() { continue; }
+                    }
+                } else if !self.warned_non_iso && self.re_timestamp.is_match(line) {
+                    self.warned_non_iso = true;
+                    eprintln!("Warning: --since/--until needs a leading ISO (YYYY-...) timestamp; lines with non-ISO leading timestamps bypass the range filter.");
+                }
+            }
+
+            let trimmed = self.re_timestamp.replace_all(line, "");
+            let trimmed = self.re_boilerplate.replace_all(&trimmed, "");
+            let final_line = trimmed.trim();
+            if final_line.is_empty() { continue; }
+            return Some((self.line_no, final_line.to_string()));
+        }
+    }
+}
+
+/// Spawn gcloud / open file / stdin — returns the reader and any child we own.
+/// gcloud mode pushes canonical time bounds into the SERVER-side filter
+/// (valid ISO by is_full_iso) to avoid downloading months of entries that
+/// local filtering would drop.
+fn make_reader(
+    args: &Args,
+    since_valid: &Option<String>,
+    until_valid: &Option<String>,
+) -> (Box<dyn BufRead>, Option<Child>) {
+    if let Some(filter) = &args.gcloud {
+        let mut gc_filter = filter.clone();
+        // bounds already canonicalized: no space separator remains
+        if let Some(s) = since_valid {
+            gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", s));
+        }
+        if let Some(u) = until_valid {
+            gc_filter.push_str(&format!(" AND timestamp<\"{}\"", u));
+        }
+        let gc_args = vec![
+            "logging".to_string(), "read".to_string(), gc_filter,
+            "--format".into(), "value(timestamp,textPayload,jsonPayload.message)".into(),
+            "--order=asc".into(),
+        ];
+        // ponytail: no --limit pushdown for --max-lines; the early-cut kill
+        // already bounds the download.
+        let mut child = Command::new("gcloud")
+            .args(&gc_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to execute gcloud: {}. Is gcloud CLI installed?", e);
+                exit(1);
+            });
+        let stdout: ChildStdout = child.stdout.take().expect("gcloud stdout");
+        (Box::new(BufReader::new(stdout)), Some(child))
+    } else if let Some(path) = &args.file_path {
+        let file = File::open(path).unwrap_or_else(|e| {
+            eprintln!("Error opening file {}: {}", path, e);
+            exit(1);
+        });
+        (Box::new(BufReader::new(file)), None)
+    } else {
+        (Box::new(BufReader::new(io::stdin())), None)
+    }
+}
+
+/// Stream mode: dedup + emit as we go; returns dedup insertions.
+fn run_stream(
+    proc: &mut Pipeline,
+    mut bloom: Option<&mut Bloom<String>>,
+    args: &Args,
+    outbuf: &mut Sink,
+) -> usize {
+    let mut count = 0usize;
+    let mut dedup_inserts = 0usize;
+    while let Some((line_no, line)) = proc.next_trimmed() {
+        if let Some(max) = args.max_lines {
+            if count >= max {
+                proc.early_cut = true;
+                break;
+            }
+        }
+        if let Some(ref mut b) = bloom {
+            // single probe: check + insert in one hash pass
+            if b.check_and_set(&line) { continue; }
+            // Track actual insertions: saturating past capacity = silent data loss
+            dedup_inserts += 1;
+        }
+        if args.json {
+            // plain usize/String struct — serialization cannot fail
+            let json = serde_json::to_string(&LogEntry {
+                index: line_no,
+                content: line,
+            }).unwrap();
+            emit(outbuf, &json);
+        } else {
+            emit(outbuf, &line);
+        }
+        count += 1;
+    }
+    dedup_inserts
+}
+
+/// Stats mode: survey the whole file; returns counts + whether capped.
+fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
+    let mut stats_map: HashMap<String, usize> = HashMap::new();
+    let mut capped = false;
+    while let Some((_, line)) = proc.next_trimmed() {
+        // get_mut fast path — no String alloc for a line already seen.
+        // Cap gates only new insertions; existing counters keep advancing.
+        if let Some(c) = stats_map.get_mut(&line) {
+            *c += 1;
+        } else if stats_map.len() < MAX_STATS_PATTERNS {
+            stats_map.insert(line, 1);
+        } else {
+            capped = true;
+        }
+    }
+    (stats_map, capped)
+}
+
+/// Sessions mode: collect Full or Summary per ID. Caps gate NEW sessions /
+/// NEW lines only — existing sessions keep collecting past their caps.
+fn collect_sessions(
+    proc: &mut Pipeline,
+    args: &Args,
+    re: &Regex,
+) -> (BTreeMap<String, Session>, bool, bool) {
+    let summary = args.summary;
+    let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
+    let mut count = 0usize;
+    let mut sessions_capped = false;
+    let mut lines_capped = false;
+    while let Some((_, line)) = proc.next_trimmed() {
+        if let Some(max) = args.max_lines {
+            if count >= max {
+                proc.early_cut = true;
+                break;
+            }
+        }
+        let Some(caps) = re.captures(&line) else { continue; };
+        // group 0 is always present when captures() succeeds
+        let id = caps.get(1)
+            .unwrap_or_else(|| caps.get(0).unwrap())
+            .as_str().to_string();
+        // len-before-entry: entry() holds the map borrow, can't re-len() here
+        let at_cap = sessions.len() >= MAX_TRACE_SESSIONS;
+        match sessions.entry(id) {
+            btree_map::Entry::Occupied(mut e) => match e.get_mut() {
+                Session::Full(v) => {
+                    if v.len() < MAX_LINES_PER_SESSION {
+                        v.push(line);
+                        count += 1;
+                    } else {
+                        lines_capped = true;
+                    }
+                }
+                Session::Summary(n, _, last) => {
+                    // auto-ref-mut binding; reuse the buffer, no per-event alloc
+                    *n += 1;
+                    last.clear();
+                    last.push_str(&line);
+                    last.push_str(&line);
+                    count += 1;
+                }
+            },
+            btree_map::Entry::Vacant(e) => {
+                if at_cap {
+                    sessions_capped = true;
+                } else {
+                    let l = line.to_string();
+                    e.insert(if summary {
+                        Session::Summary(1, l.clone(), l)
+                    } else {
+                        Session::Full(vec![l])
+                    });
+                    count += 1;
+                }
+            }
+        }
+    }
+    (sessions, sessions_capped, lines_capped)
+}
+
+/// Emit collected sessions — one JSON object or one text block per ID.
+fn emit_sessions(sessions: &BTreeMap<String, Session>, json: bool, outbuf: &mut Sink) {
+    if json {
+        for (id, s) in sessions {
+            let value = match s {
+                Session::Full(lines) => serde_json::json!({"id": id, "events": lines}),
+                Session::Summary(count, first, last) => serde_json::json!({
+                    "id": id, "count": count, "first": first, "last": last
+                }),
+            };
+            let out = serde_json::to_string(&value).unwrap();
+            emit(outbuf, &out);
+        }
+    } else {
+        let summary = sessions.values().next()
+            .map_or(false, |s| matches!(s, Session::Summary(..)));
+        if summary {
+            emit(outbuf, &format!("\n=== TRACE SUMMARY: {} sessions ===", sessions.len()));
+        }
+        for (id, s) in sessions {
+            match s {
+                Session::Full(lines) => {
+                    emit(outbuf, &format!("\n--- [{}] ---\n{}", id, lines.join("\n")));
+                }
+                Session::Summary(count, first, last) => {
+                    // 1-event session: first == last — print once, singular label
+                    let body = if *count == 1 {
+                        first.to_string()
+                    } else {
+                        format!("{}\n{}", first, last)
+                    };
+                    emit(outbuf, &format!(
+                        "--- [{}] {} event{} ---\n{}", id, count,
+                        if *count == 1 { "" } else { "s" }, body
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -196,8 +528,8 @@ fn main() {
         })
     }).unwrap_or_default();
 
-    // Compile ALL regexes BEFORE spawning gcloud: a bad pattern must not orphan
-    // a running child process.
+    // Compile ALL regexes BEFORE spawning gcloud: a bad pattern must not
+    // orphan a running child process.
     let re_timestamp = compile_regex(
         config.timestamp_regex.as_deref().unwrap_or(
             // ponytail: offsets matched so trimming strips them fully; the
@@ -215,22 +547,30 @@ fn main() {
             let source = if args.trace.is_some() { "--trace" } else { "config default_trace" };
             compile_regex(p, source)
         });
-    let trace_mode = trace_re.is_some();
-    let summary_mode = args.summary && trace_mode;
-    if args.summary && !trace_mode && !args.stats {
+
+    // Mode precedence: stats is survey (trace/summary ignored); trace/summary
+    // need an ID pattern; plain stream otherwise. Dedup applies to stream only.
+    let run = if args.stats {
+        Run::Stats
+    } else if trace_re.is_some() {
+        Run::Sessions
+    } else {
+        Run::Stream
+    };
+
+    if args.summary && trace_re.is_none() {
         eprintln!("Error: --summary needs an ID pattern (--trace or config default_trace).");
         exit(1);
     }
-
-    if args.dedup && trace_mode {
-        eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
-    }
-    if args.stats && (trace_mode || args.summary) {
+    if args.stats && trace_re.is_some() {
         eprintln!("Note: --stats is survey mode; --trace/--summary ignored.");
+    }
+    if args.dedup && trace_re.is_some() {
+        eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
     }
 
     // Bounds are fixed for the whole run: validate + canonicalize once, not
-    // per line. Date-only bounds grow day-start (since / next-day (until)
+    // per line. Date-only bounds grow day-start (since) / next-day (until)
     // times so the end day isn't excluded wholesale; spaces become 'T'.
     let since_valid: Option<String> = args.since.as_ref()
         .filter(|s| is_full_iso(s)).map(|s| canonical_since(s));
@@ -238,282 +578,105 @@ fn main() {
         .filter(|u| is_full_iso(u)).map(|u| canonical_until(u));
     let range_filter = since_valid.is_some() || until_valid.is_some();
 
-    // Reader: gcloud child process, file, or stdin.
-    let mut gc_child: Option<Child> = None;
-    let mut reader: Box<dyn BufRead> = if let Some(filter) = &args.gcloud {
-        // Push validated time bounds into the SERVER-side filter: they are
-        // valid ISO by is_full_iso, so embed as timestamp clauses to avoid
-        // downloading months of entries that local filtering would drop.
-        let mut gc_filter = filter.clone();
-        // Bounds already passed normalize_iso: no space separator remains
-        if let Some(s) = &since_valid {
-            gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", s));
-        }
-        if let Some(u) = &until_valid {
-            gc_filter.push_str(&format!(" AND timestamp<\"{}\"", u));
-        }
-        let gc_args = vec![
-            "logging".to_string(), "read".to_string(), gc_filter,
-            "--format".into(), "value(timestamp,textPayload,jsonPayload.message)".into(),
-            "--order=asc".into(),
-        ];
-        // ponytail: no --limit pushdown for --max-lines; the early-cut kill
-        // already bounds the download.
-        let mut child = Command::new("gcloud")
-            .args(&gc_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to execute gcloud: {}. Is gcloud CLI installed?", e);
-                exit(1);
-            });
-        let stdout: ChildStdout = child.stdout.take().expect("gcloud stdout");
-        gc_child = Some(child);
-        Box::new(BufReader::new(stdout))
-    } else if let Some(path) = &args.file_path {
-        let file = File::open(path).unwrap_or_else(|e| {
-            eprintln!("Error opening file {}: {}", path, e);
-            exit(1);
-        });
-        Box::new(BufReader::new(file))
-    } else {
-        Box::new(BufReader::new(io::stdin()))
+    let (reader, mut gc_child) = make_reader(&args, &since_valid, &until_valid);
+
+    let mut proc = Pipeline {
+        reader,
+        re_timestamp,
+        re_boilerplate,
+        query: args.query.clone(),
+        range_filter,
+        gc: gc_child.is_some(),
+        since_valid,
+        until_valid,
+        ts_norm: String::new(),
+        warned_non_iso: false,
+        read_error: None,
+        early_cut: false,
+        empty_entries: 0,
+        line_no: 0,
+        raw_buf: Vec::new(),
     };
 
-    // BTreeMap = stable, reproducible session order across runs
-    let mut trace_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    // summary mode: (event count, first, last) — IDs always preserved
-    let mut summary_map: BTreeMap<String, (usize, String, String)> = BTreeMap::new();
-
-    let mut stats_map: HashMap<String, usize> = HashMap::new();
-    const MAX_STATS_PATTERNS: usize = 100_000;
-    const MAX_TRACE_SESSIONS: usize = 10_000;
-    const MAX_LINES_PER_SESSION: usize = 1_000;
-
-    let mut sessions_capped = false;
-    let mut session_lines_capped = false;
-    let mut stats_capped = false;
-
-    // --stats counts before dedup, so bloom has no effect there: skip the
-    // 10M-item filter and its per-line hashing entirely
-    let mut bloom = if args.dedup && !trace_mode && !args.stats {
+    // --stats/--trace never stream per line, so bloom only exists in stream mode
+    let mut bloom = if matches!(run, Run::Stream) && args.dedup {
         Some(Bloom::new_for_fp_rate(10_000_000, 0.01).expect("Failed to init bloom filter"))
     } else {
         None
     };
-    let mut count = 0;
-    let mut ts_norm = String::new();
-    let mut warned_non_iso = false;
-    let mut dedup_inserts = 0usize;
-    let mut empty_entries = 0usize;
 
     let mut out = io::stdout().lock();
-    let mut outbuf = BufWriter::new(&mut out);
+    let mut outbuf: Sink = BufWriter::new(&mut out);
 
-    // read_until (bytes) + lossy decode: one invalid UTF-8 byte degrades to
-    // U+FFFD on that line instead of erroring and truncating the stream.
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut line_no = 0usize;
-    let mut read_error: Option<io::Error> = None;
-    let mut early_cut = false;
-    loop {
-        raw_buf.clear();
-        match reader.read_until(b'\n', &mut raw_buf) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(e) => {
-                read_error = Some(e);
-                break;
+    let result = match run {
+        Run::Stats => {
+            let (map, capped) = run_stats(&mut proc);
+            RunResult {
+                stats_map: Some(map),
+                sessions: None,
+                stats_capped: capped,
+                sessions_capped: false,
+                session_lines_capped: false,
+                dedup_inserts: 0,
             }
         }
-        line_no += 1;
-
-        // max_lines caps output/trace collection; --stats surveys the whole file
-        if let Some(max) = args.max_lines {
-            if !args.stats && count >= max {
-                early_cut = true;
-                break;
+        Run::Sessions => {
+            let (map, sessions_capped, session_lines_capped) =
+                collect_sessions(&mut proc, &args, trace_re.as_ref().unwrap());
+            RunResult {
+                stats_map: None,
+                sessions: Some(map),
+                stats_capped: false,
+                sessions_capped,
+                session_lines_capped,
+                dedup_inserts: 0,
             }
         }
-
-        let line = String::from_utf8_lossy(&raw_buf);
-        let line = line.trim_end_matches(['\n', '\r']);
-
-        // gcloud entries with neither textPayload nor jsonPayload.message
-        // render as blank lines: count them so vanished records are visible
-        if gc_child.is_some() && line.trim().is_empty() {
-            empty_entries += 1;
-        }
-
-        // Fast rejects FIRST, before any allocation
-        if let Some(ref q) = args.query { if !line.contains(q) { continue; } }
-
-        // Time range: the line's FIRST timestamp match, wherever it sits
-        // (brackets/level prefixes are common), and it must be ISO — Apache
-        // format ("09/Oct/2026:...") also matches but sorts backwards
-        // lexicographically. ponytail: ts fields come first in real formats,
-        // so first-match is the intended ts; ISO strings sort chronologically
-        // and space separators are normalized to 'T' for the compare.
-        if range_filter {
-            let lead = re_timestamp.find(line)
-                .filter(|m| is_full_iso(m.as_str()))
-                .map(|m| m.as_str());
-            if let Some(ts) = lead {
-                let ts = normalize_iso(ts, &mut ts_norm);
-                if let Some(s) = &since_valid {
-                    if ts < s.as_str() { continue; }
-                }
-                if let Some(u) = &until_valid {
-                    if ts >= u.as_str() { continue; }
-                }
-            } else if !warned_non_iso && re_timestamp.is_match(line) {
-                warned_non_iso = true;
-                eprintln!("Warning: --since/--until needs a leading ISO (YYYY-...) timestamp; lines with non-ISO leading timestamps bypass the range filter.");
+        Run::Stream => {
+            let dedup_inserts = run_stream(&mut proc, bloom.as_mut(), &args, &mut outbuf);
+            RunResult {
+                stats_map: None,
+                sessions: None,
+                stats_capped: false,
+                sessions_capped: false,
+                session_lines_capped: false,
+                dedup_inserts,
             }
-        }
-
-        let trimmed = re_timestamp.replace_all(line, "");
-        let trimmed = re_boilerplate.replace_all(&trimmed, "");
-        let final_line = trimmed.trim();
-        if final_line.is_empty() { continue; }
-
-        // Stats: get_mut fast path — no String alloc for a line already seen.
-        // Cap gates only new insertions; existing counters keep advancing.
-        if args.stats {
-            if let Some(c) = stats_map.get_mut(final_line) {
-                *c += 1;
-            } else if stats_map.len() < MAX_STATS_PATTERNS {
-                stats_map.insert(final_line.to_string(), 1);
-            } else {
-                stats_capped = true;
-            }
-        }
-
-        // Trace: collect BEFORE dedup (session integrity); single entry probe.
-        // --stats is survey mode: sessions are never emitted, don't collect.
-        if !args.stats && let Some(ref re) = trace_re {
-            match re.captures(line) {
-                Some(caps) => {
-                    // group 0 is always present when captures() succeeds
-                    let id = caps.get(1)
-                        .unwrap_or_else(|| caps.get(0).unwrap())
-                        .as_str().to_string();
-                    if summary_mode {
-                        // summary keeps per-ID count + first/last event only
-                        let len_before = summary_map.len();
-                        match summary_map.entry(id) {
-                            btree_map::Entry::Occupied(mut e) => {
-                                // reuse the last-event buffer, no per-event alloc
-                                let s = e.get_mut();
-                                s.0 += 1;
-                                s.2.clear();
-                                s.2.push_str(final_line);
-                                count += 1;
-                            }
-                            btree_map::Entry::Vacant(e) => {
-                                if len_before < MAX_TRACE_SESSIONS {
-                                    let l = final_line.to_string();
-                                    e.insert((1, l.clone(), l));
-                                    count += 1;
-                                } else {
-                                    sessions_capped = true;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let len_before = trace_map.len();
-                    match trace_map.entry(id) {
-                        btree_map::Entry::Occupied(mut e) => {
-                            let session = e.get_mut();
-                            if session.len() < MAX_LINES_PER_SESSION {
-                                session.push(final_line.to_string());
-                                count += 1;
-                            } else {
-                                session_lines_capped = true;
-                            }
-                        }
-                        btree_map::Entry::Vacant(e) => {
-                            if len_before < MAX_TRACE_SESSIONS {
-                                e.insert(vec![final_line.to_string()]);
-                                count += 1;
-                            } else {
-                                sessions_capped = true;
-                            }
-                        }
-                    }
-                }
-                None => continue,
-            }
-        }
-
-        if let Some(ref mut b) = bloom {
-            // single probe: check + insert in one hash pass
-            if b.check_and_set(final_line) { continue; }
-            // Track actual insertions: saturating past capacity = silent data loss
-            dedup_inserts += 1;
-        }
-
-        // Stream output: trace mode emits sessions at the end, stats none;
-        // otherwise one line per event
-        if !trace_mode && !args.stats {
-            if args.json {
-                // plain usize/String struct — serialization cannot fail
-                let json = serde_json::to_string(&LogEntry {
-                    index: line_no,
-                    content: final_line.to_string(),
-                }).unwrap();
-                emit(&mut outbuf, &json);
-            } else {
-                emit(&mut outbuf, final_line);
-            }
-            count += 1;
-        }
-    }
-
-    if let Some(ref e) = read_error {
-        eprintln!("Warning: stopped after input line {}: {} (results collected so far are emitted)", line_no, e);
-    }
-
-    // We cut the stream early (--max-lines): kill gcloud outright. rust
-    // ignores SIGPIPE and children inherit it, so gcloud would die on EPIPE
-    // with a nonzero exit — reported as a failure we caused.
-    if early_cut {
-        if let Some(child) = gc_child.as_mut() { let _ = child.kill(); }
-    }
-    // Drop the read end so a still-streaming gcloud gets EPIPE and exits
-    // instead of deadlocking wait() below.
-    drop(reader);
-
-    let flush = |buf: &mut BufWriter<&mut io::StdoutLock>| {
-        if let Err(e) = buf.flush() {
-            on_write_err(e, "flushing output");
-            exit(1);
         }
     };
+
+    let stopped_at_line = proc.line_no;
+    let early_cut = proc.early_cut;
+    let empty_entries = proc.empty_entries;
+    let read_error = proc.read_error.take();
+    if let Some(ref e) = read_error {
+        eprintln!("Warning: stopped after input line {}: {} (results collected so far are emitted)", stopped_at_line, e);
+    }
+    // Dropping the pipeline closes the read end: a still-streaming gcloud
+    // gets EPIPE and exits instead of deadlocking the wait() below.
+    drop(proc);
+
     flush(&mut outbuf);
 
-    if dedup_inserts > 10_000_000 {
+    if result.dedup_inserts > 10_000_000 {
         eprintln!("Warning: --dedup exceeded 10M unique lines; bloom filter is saturated and unique lines may be dropped as false duplicates.");
     }
     if empty_entries > 0 {
         eprintln!("Note: {} gcloud entr{} had no textPayload/message and were skipped.", empty_entries, if empty_entries == 1 { "y" } else { "ies" });
     }
-
-    if stats_capped {
+    if result.stats_capped {
         eprintln!("Warning: --stats reached its {} unique-pattern cap; later patterns untracked (existing counts are complete).", MAX_STATS_PATTERNS);
     }
-    if sessions_capped {
+    if result.sessions_capped {
         eprintln!("Warning: trace session cap ({}) reached; later sessions not collected.", MAX_TRACE_SESSIONS);
     }
-    if session_lines_capped {
+    if result.session_lines_capped {
         eprintln!("Warning: some sessions hit the {}-line cap; their tails were cut.", MAX_LINES_PER_SESSION);
     }
 
-    if args.stats {
+    if let Some(map) = result.stats_map {
         // Count desc, then pattern asc = deterministic ties
-        let mut sorted: Vec<_> = stats_map.into_iter().collect();
+        let mut sorted: Vec<_> = map.into_iter().collect();
         let cmp = |a: &(String, usize), b: &(String, usize)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
         // ponytail: O(n) top-20 partition, full sort only on the 20 printed
         if sorted.len() > 20 {
@@ -528,38 +691,17 @@ fn main() {
         eprintln!("==============================");
     }
 
-    if summary_mode && !args.stats {
-        if args.json {
-            for (id, (count, first, last)) in &summary_map {
-                let json = serde_json::to_string(&serde_json::json!({
-                    "id": id, "count": count, "first": first, "last": last
-                })).unwrap();
-                emit(&mut outbuf, &json);
-            }
-        } else {
-            emit(&mut outbuf, &format!("\n=== TRACE SUMMARY: {} sessions ===", summary_map.len()));
-            for (id, (count, first, last)) in &summary_map {
-                // 1-event session: first == last — print once, singular label
-                let body = if *count == 1 { first.to_string() } else { format!("{}\n{}", first, last) };
-                emit(&mut outbuf, &format!(
-                    "--- [{}] {} event{} ---\n{}", id, count,
-                    if *count == 1 { "" } else { "s" }, body
-                ));
-            }
-        }
-    } else if trace_mode {
-        for (id, lines) in trace_map {
-            if args.json {
-                let json = serde_json::to_string(&serde_json::json!({"id": id, "events": lines}))
-                    .unwrap();
-                emit(&mut outbuf, &json);
-            } else {
-                emit(&mut outbuf, &format!("\n--- [{}] ---\n{}", id, lines.join("\n")));
-            }
-        }
+    if let Some(sessions) = result.sessions {
+        emit_sessions(&sessions, args.json, &mut outbuf);
     }
     flush(&mut outbuf);
 
+    // We cut the stream early (--max-lines): kill gcloud outright. Rust
+    // ignores SIGPIPE and children inherit it, so gcloud would die on EPIPE
+    // with a nonzero exit — reported as a failure we caused.
+    if early_cut {
+        if let Some(child) = gc_child.as_mut() { let _ = child.kill(); }
+    }
     if let Some(child) = gc_child.as_mut() {
         match child.wait() {
             Ok(status) if !status.success() => {
