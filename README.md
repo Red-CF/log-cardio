@@ -40,12 +40,12 @@ cardio --bq 'SELECT FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp, tex
 cardio --raw app.log                        # fidelity: no dedup, no cap
 ```
 
-> **⚠ The default pipeline drops lines.** Whole repeated lines are
-> removed (Bloom filter — **~1% false positives: a unique line can be
-> discarded as if repeated**) and output stops at 2000 lines
-> (`--max-lines` overrides). It's the right trade for trimming noise;
-> when any line might be THE answer, run `--raw` or narrow with
-> `--query`.
+> **⚠ The default pipeline drops lines.** Repeated lines are removed
+> (Bloom filter — **~1% false positives: a unique line can be discarded
+> as if repeated**) and only the **last** 2000 lines are kept — the most
+> recent; the head of the range is trimmed (`--max-lines` overrides). It's
+> the right trade for trimming noise; when any line might be THE answer,
+> run `--raw` or narrow with `--query`.
 
 gcloud mode pushes `--since`/`--until` bounds into the server-side filter
 (timestamp clauses), so it downloads only the window you asked for. Without
@@ -71,7 +71,8 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 - `--since`/`--until` are NOT pushed into bq (the SQL is yours): filter
   dates in the query with a `WHERE` clause over `FORMAT_TIMESTAMP(...)`
   text, and the same ISO bounds still apply locally.
-- `--max-lines` cuts the bq process early once the cap is reached.
+- `--max-lines` keeps the last N rows (the whole bq output is read
+  first — the cap no longer trims the download).
 
 ## Flags
 
@@ -83,7 +84,7 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
 | `--dedup` | Drop repeated whole lines (Bloom filter — **~1% false positives, and they're unique lines thrown away**). |
-| `--max-lines N` | Cap output (events in `--trace`/`--summary` mode). |
+| `--max-lines N` | Keep only the LAST N lines (recent beat old, whole input reads; events in `--trace`/`--summary` mode). |
 | `--json` | NDJSON output: `{"index","content"}` per line; with `--trace` → `{"id","events"}`; with `--summary` → `{"id","count","first","last"}`. |
 | `--since TS` | Timestamp >= this. ISO (`2026-10-09T05:00:00`) or `YYYY-MM-DD` (= day start). |
 | `--until TS` | Timestamp < this. ISO, or `YYYY-MM-DD` (= NEXT-day start, so the end day is kept). |
