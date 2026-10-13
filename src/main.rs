@@ -134,6 +134,14 @@ fn flush(outbuf: &mut Sink) {
     }
 }
 
+/// Exactly MAX_FRAC frac digits on every compare: equal instants compare
+/// equal and longer instants compare larger, on both line and bound side.
+/// 19 covers real (≤ nanosecond) and pathological ≤19; longer fracs
+/// truncate — ceiling: a >19-digit --until bound could drop one final
+/// bucket (compare numerically via chrono if that ever matters).
+const MAX_FRAC: usize = 19;
+const ZEROS: &str = "0000000000000000000"; // MAX_FRAC zeros
+
 /// Digit run after the '.' in a fractional instant: "45.5" → Some(1),
 /// no dot → None. The run itself (length), not padability.
 fn short_frac(s: &str) -> Option<usize> {
@@ -142,9 +150,11 @@ fn short_frac(s: &str) -> Option<usize> {
 }
 
 /// THE single canonical-for-compare writer: space→'T' (" " < "T" would
-/// mis-order), date-only = day start, minute precision — tz-suffixed or
-/// not — pads to ":00", fractions normalize to exactly 9 digits (zeros go
-/// at the digit run's end, before any suffix; longer fracs truncate).
+/// mis-order), zero tz offsets (Z, ±00:00, ±0000) drop the suffix so
+/// "…45+00:00" and "…45Z" compare equal ('+' < 'Z' would mis-order),
+/// date-only = day start, minute precision — tz-suffixed or not — pads
+/// to ":00", fractions normalize to MAX_FRAC digits (zeros at the run's
+/// end, before any remaining suffix; longer fracs truncate).
 /// Lines and bounds both land here — one invariant, no drift.
 fn to_canonical(s: &str, out: &mut String) {
     out.clear();
@@ -155,38 +165,47 @@ fn to_canonical(s: &str, out: &mut String) {
     } else {
         out.push_str(s);
     }
-    let date_only = out.len() == 10;
-    let b = out.as_bytes();
-    // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
-    // is not the ':' that would start seconds (may be a tz suffix)
-    let minute_only = out.len() >= 16
-        && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':');
-    let dot_at = if b.contains(&b'.') { out.find('.') } else { None };
-    if date_only {
+    // zero offsets are UTC: strip the suffix before the pad passes
+    for off in ["Z", "+00:00", "-00:00", "+0000", "-0000"] {
+        if out.ends_with(off) {
+            out.truncate(out.len() - off.len());
+            break;
+        }
+    }
+    if out.len() == 10 {
         out.push_str("T00:00:00");
         return;
     }
-    if minute_only {
+    // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
+    // is not the ':' that would start seconds (may be a tz suffix)
+    let needs_minute_pad = {
+        let b = out.as_bytes();
+        out.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':')
+    };
+    if needs_minute_pad {
         out.insert_str(16, ":00");
     }
-    if let Some(i) = dot_at {
-        let run = out[i + 1..].bytes().take_while(|c| c.is_ascii_digit()).count();
-        if run < 9 {
-            for _ in 0..(9 - run) { out.insert(i + 1 + run, '0'); }
-        } else {
-            for _ in 0..(run - 9) { out.remove(i + 10); }
+    if let Some(i) = out.find('.') {
+        let run = short_frac(&out).unwrap();
+        // one memmove each way; recompute the dot after any ":00" insert
+        if run < MAX_FRAC {
+            out.insert_str(i + 1 + run, &ZEROS[..MAX_FRAC - run]);
+        } else if run > MAX_FRAC {
+            out.drain(i + 1 + MAX_FRAC..i + 1 + run);
         }
     }
 }
 
-/// Predicate mirroring to_canonical's transformations — both call sites
-/// use it, so the fast path can't drift from the writer. Unchanged
-/// matches keep the borrowed slice (no copy on the hot path).
+/// Predicate mirroring to_canonical's transformation set — derived from the
+/// same helper calls; any new rule must land in both. Unchanged matches
+/// keep the borrowed slice (no copy on the hot path).
 fn ts_canonical_needed(s: &str) -> bool {
     let b = s.as_bytes();
     (s.len() > 10 && b[10] == b' ')
     || s.len() == 10
-    || short_frac(s).is_some()
+    // zero offsets strip to seconds; non-MAX_FRAC runs pad/truncate
+    || short_frac(s).is_some_and(|run| run != MAX_FRAC)
+    || ["Z", "+00:00", "-00:00", "+0000", "-0000"].iter().any(|o| s.ends_with(o))
     || (s.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':'))
 }
 

@@ -345,6 +345,35 @@ fn tz_suffixed_minute_bound_pads_to_seconds() {
 }
 
 #[test]
+fn until_long_fraction_keeps_before_bucket() {
+    // >MAX_FRAC-digit fracs truncate to 19 first: the exclusive bound must
+    // not swallow the final sub-nanosecond bucket (9999999995 < 9.9999999999)
+    let path = fixture("2026-10-09T12:34:45.9999999995 event\n");
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "2026-10-09T12:34:45.9999999999"]);
+
+    assert!(out.contains("event"), "0.9999999995 < 0.9999999999, got: {out:?}");
+}
+
+#[test]
+fn zero_offset_and_z_compare_equal() {
+    // '+00:00' and 'Z' are the same instant: suffixes must not mis-order
+    // ('+' 0x2B < 'Z' 0x5A would drop the line from an equal --since)
+    let p1 = fixture("2026-10-09T12:34:45+00:00 event\n");
+    let p2 = fixture("2026-10-09T12:34:45+00:00 event\n");
+    let p3 = fixture("2026-10-09T12:34:45Z event\n");
+    let s1 = p1.0.to_string_lossy().into_owned();
+    let s2 = p2.0.to_string_lossy().into_owned();
+    let s3 = p3.0.to_string_lossy().into_owned();
+
+    let kept = cardio(&["--since", "2026-10-09T12:34:45Z", &s1]);
+    assert!(kept.contains("event"), "equal instant passes inclusive bound, got: {kept:?}");
+    let dropped = cardio(&["--until", "2026-10-09T12:34:45Z", &s2]);
+    assert!(!dropped.contains("event"), "equal instant fails exclusive bound, got: {dropped:?}");
+    let dropped2 = cardio(&["--until", "2026-10-09T12:34:45+00:00", &s3]);
+    assert!(!dropped2.contains("event"), "symmetric case (Z line, +00:00 bound), got: {dropped2:?}");
+}
+
+#[test]
 fn minute_precision_ts_pads_to_seconds() {
     // minute-precision line ts must pad to ":00": unpadded it sorts as a bare
     // prefix strictly below its own minute's second-precision bounds
