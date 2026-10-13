@@ -7,17 +7,43 @@ on:
 
 jobs:
   test:
-    # the tool claims platform independence (file/stdin sources) — contract
-    # needs a real run on all three
+    # the platform contract: file/stdin plus spawning gcloud/bq behave
+    # differently per OS — needs a real run on all three. The Linux leg
+    # doubles as coverage: instrumented tests on main feed the gh-pages badge.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
+      - name: tests + coverage (Linux leg, feeds the badge on main)
+        if: runner.os == 'Linux'
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov
+          cargo llvm-cov --lcov --output-path lcov.info
+      - name: update gh-pages badge
+        if: runner.os == 'Linux' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PCT=$(awk -F: '/^LF:/{lf+=$2}/^LH:/{lh+=$2}END{printf "%.0f", 100*lh/(lf?lf:1)}' lcov.info)
+          COLOR=$([ "$PCT" -ge 90 ] && echo 44cc11 || ([ "$PCT" -ge 75 ] && echo 97ca00 || echo dfb317))
+          printf '<svg xmlns="http://www.w3.org/2000/svg" width="108" height="20"><rect width="108" height="20" rx="3" fill="#%s"/><text x="54" y="14" font-size="11" font-family="Verdana,sans-serif" fill="#fff" text-anchor="middle">coverage %s%%</text></svg>\n' "$COLOR" "$PCT" > coverage.svg
+          URL="https://x-access-token:${GH_TOKEN}@github.com/Red-CF/log-cardio.git"
+          git clone -q --depth=1 --branch=gh-pages "$URL" ghp \
+            || { mkdir ghp && git -C ghp init -q -b gh-pages && git -C ghp remote add origin "$URL"; }
+          mv coverage.svg ghp/coverage.svg
+          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add coverage.svg
+          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "coverage badge: $PCT%" --allow-empty
+          git -C ghp push -q origin gh-pages
+      - name: tests
+        if: runner.os != 'Linux'
+        run: cargo test
         # network-fetching tests are faked via PATH stubs (cfg(unix)) so
         # this works offline everywhere
 
@@ -43,40 +69,9 @@ jobs:
           name: cardio-${{ runner.os }}
           path: cardio-*
 
-  coverage:
-    # one OS is enough for coverage — it's a tooling report, not a contract;
-    # on main pushes the lcov total feeds the self-hosted gh-pages badge
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
-      - run: cargo install cargo-llvm-cov
-      - name: measure coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
-      - name: update gh-pages badge
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          PCT=$(awk -F: '/^LF:/{lf+=$2}/^LH:/{lh+=$2}END{printf "%.0f", 100*lh/(lf?lf:1)}' lcov.info)
-          COLOR=$([ "$PCT" -ge 90 ] && echo 44cc11 || ([ "$PCT" -ge 75 ] && echo 97ca00 || echo dfb317))
-          printf '<svg xmlns="http://www.w3.org/2000/svg" width="108" height="20"><rect width="108" height="20" rx="3" fill="#%s"/><text x="54" y="14" font-size="11" font-family="Verdana,sans-serif" fill="#fff" text-anchor="middle">coverage %s%%</text></svg>\n' "$COLOR" "$PCT" > coverage.svg
-          URL="https://x-access-token:${GH_TOKEN}@github.com/Red-CF/log-cardio.git"
-          git clone -q --depth=1 --branch=gh-pages "$URL" ghp \
-            || { mkdir ghp && git -C ghp init -q -b gh-pages && git -C ghp remote add origin "$URL"; }
-          mv coverage.svg ghp/coverage.svg
-          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add coverage.svg
-          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "coverage badge: $PCT%" --allow-empty
-          git -C ghp push -q origin gh-pages
-
   version:
     # the merge gate: a PR must bump Cargo.toml above what crates.io has,
-    # or the merge button stays locked (the release job's auto-bump only
-    # covers the rare post-check race of two near-simultaneous merges)
+    # or the merge button stays locked
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
