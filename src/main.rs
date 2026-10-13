@@ -217,9 +217,12 @@ fn strip_tz(out: &mut String) {
 /// ISO 8601 end-of-day "T24:00(:00…0)" — valid only with zero minutes (and
 /// zero seconds when present). THE one home of the rule: is_full_iso
 /// validates through it, to_canonical rewrites exactly what it accepts —
-/// the two can't drift. Frac on MINUTES (b[16] == '.') is not accepted —
-/// that grammar is rejected wholesale (its canonical rewrite would drop
-/// the frac silently).
+/// the two can't drift. The '.'-check is belt-and-braces, not enforcement:
+/// frac-on-minutes is rejected WHOLESALE by FULL_ISO_RE (a frac may only
+/// follow seconds), so this condition is unreachable while that grammar
+/// holds — its job is keeping the predicate honest if the regex ever
+/// relaxes. The CLI-reachable guard is to_canonical's own minute_only
+/// assert.
 fn is_eod_24(b: &[u8]) -> bool {
     b[11] == b'2' && b[12] == b'4' && b[13] == b':'
         && b[14] == b'0' && b[15] == b'0'
@@ -277,6 +280,13 @@ fn to_canonical(s: &str, out: &mut String) {
         out.len() >= 16 && b[10] == b'T' && b[13] == b':' && b.get(16) != Some(&b':')
     };
     if minute_only {
+        // FULL_ISO_RE forbids frac-on-minutes wholesale (a frac may only
+        // follow seconds): after the tz strip a partial HH:MM tail is
+        // exactly the string's end. A regex relaxation leaking one in
+        // must fail LOUD — ".5" on minutes silently read as half a second
+        // would be a wrong instant, no panic (the drift trap is_eod_24
+        // closes for hour 24, mirrored here for normal hours).
+        assert!(out.len() == 16, "frac-on-minutes drift: {out:?}");
         out.insert_str(16, ":00");
     }
     if let Some(i) = out.find('.') {
@@ -543,14 +553,25 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
 /// Canonical-shape gate shared by BOTH gcloud pushdown embedders
 /// (server_ts, until_server_bound): the canonical string is a full
 /// datetime with a MAX_FRAC-padded frac. Drift means a silently wrong or
-/// garbage gcloud literal — panic loud, naming the string.
+/// garbage gcloud literal — panic loud, naming the string, in ONE
+/// unified message (field digit-ness included, so the downstream
+/// parse/expects can never fire first).
 fn assert_canonical_shape(canonical: &str) {
     let b = canonical.as_bytes();
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(|c| c.is_ascii_digit());
+    let digits_from = |r: std::ops::RangeFrom<usize>| b[r].iter().all(|c| c.is_ascii_digit());
     let ok = b.len() == 19 + 1 + MAX_FRAC
-        && b.get(10) == Some(&b'T')
+        && b[4] == b'-' && b[7] == b'-' && b[10] == b'T'
         && b[13] == b':'
         && b[16] == b':'
-        && b[19] == b'.';
+        && b[19] == b'.'
+        && digits(0..4)
+        && digits(5..7)
+        && digits(8..10)
+        && digits(11..13)
+        && digits(14..16)
+        && digits(17..19)
+        && digits_from(20..);
     assert!(ok, "canonical shape drift: {canonical:?}");
 }
 
