@@ -2,6 +2,8 @@
 name = "cardio"
 version = "0.1.0"
 edition = "2024"
+description = "Trim the fat from logs for LLM agents: lean default pipeline (trim + dedup + cap), direct gcloud/bq streaming, trace grouping and surveys — GBs in, tokens out."
+license = "MIT"
 
 [dependencies]
 bloomfilter = "3.0.2"
