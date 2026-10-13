@@ -509,14 +509,52 @@ fn minute_precision_line_enters_range_filter() {
 #[test]
 fn agent_md_prints_card() {
     // the card must stay honest: exit 0, name the tool and the flags
-    // the agent actually needs (dedup for tokens, since/until ranges)
+    // the agent actually needs (lean mode, the dedup warning, ranges)
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .arg("--agent-md")
         .output()
         .expect("cardio binary should run");
     assert!(out.status.success(), "got: {:?}", out.status);
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("# cardio") && s.contains("--dedup") && s.contains("--since"), "got: {s:?}");
+    assert!(
+        s.contains("--lean") && s.contains("unique lines") && s.contains("--since"),
+        "got: {s:?}"
+    );
+}
+
+#[test]
+fn lean_composes_dedup_and_default_cap() {
+    // --lean = dedup on + --max-lines 2000 (overridable); repeats must
+    // collapse and the cap must apply without an explicit --max-lines
+    let mut content = String::new();
+    content.push_str("2026-10-09T12:00:00 repeated start\n");
+    for i in 0..2100 {
+        content.push_str(&format!("2026-10-09T12:{:02}:{:02} unique-{i:04}\n", i / 60, i % 60));
+    }
+    content.push_str("2026-10-09T23:00:00 repeated start\n");
+    let path = fixture(&content);
+    let p = path.0.to_string_lossy().into_owned();
+
+    let out = cardio(&["--lean", &p]);
+    // the two "repeated start" lines collapse to the first (dedup)
+    let count = out.matches("repeated start").count();
+    assert_eq!(count, 1, "dedup should keep one, got {count}");
+    // cap: 2000 output lines = "repeated start" + unique-0000..1998;
+    // unique-1999 onward never printed
+    assert!(out.contains("unique-1998") && !out.contains("unique-1999"), "cap 2000 missed");
+    // explicit --max-lines overrides the lean default
+    let capped = cardio(&["--lean", "--max-lines", "5", &p]);
+    assert!(capped.lines().count() <= 5, "got {}", capped.lines().count());
+}
+
+#[test]
+fn stats_json_emits_patterns_on_stdout() {
+    let path = fixture("2026-10-09T12:00:00 alpha\n2026-10-09T12:00:01 beta\n2026-10-09T12:00:02 alpha\n");
+    let p = path.0.to_string_lossy().into_owned();
+    let out = cardio(&["--stats", "--json", &p]);
+    // NDJSON on stdout, patterns from the TRIMMED line bodies
+    assert!(out.contains("\"count\":2") && out.contains("alpha"), "got: {out:?}");
+    assert!(out.contains("\"count\":1") && out.contains("beta"), "got: {out:?}");
 }
 
 #[test]

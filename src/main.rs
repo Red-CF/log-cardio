@@ -13,9 +13,12 @@ mod agent_md;
 const MAX_STATS_PATTERNS: usize = 100_000;
 const MAX_TRACE_SESSIONS: usize = 10_000;
 const MAX_LINES_PER_SESSION: usize = 1_000;
+/// --lean output cap: enough events for a debugging session, small
+/// enough that an agent never swallows a token wall by accident.
+const LEAN_MAX_LINES: usize = 2_000;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Trim noise from logs for LLM processing")]
+#[command(author, version, about = "Trim noise from logs for LLM agents")]
 struct Args {
     /// Path to the log file. If omitted, reads from stdin or GCloud.
     file_path: Option<String>,
@@ -69,6 +72,11 @@ struct Args {
     /// Path to TOML config file (timestamp_regex, boilerplate_regex, default_trace)
     #[arg(long)]
     config: Option<String>,
+
+    /// Agent mode: --dedup on + --max-lines 2000 unless you pass your own
+    /// --max-lines. THE way agents read logs; drop it for raw fidelity.
+    #[arg(long)]
+    lean: bool,
 
     /// Print an agent-facing markdown card (what cardio is, flags, output,
     /// time gotchas) and exit — pipe it: `cardio --agent-md > AGENTS.md`
@@ -884,6 +892,15 @@ fn main() {
         exit(0);
     }
 
+    // --lean: compose the agent defaults. Mutating args here instead of
+    // sprinkling `|| args.lean` at every site keeps the runners untouched:
+    // dedup on, --max-lines defaulting to LEAN_MAX_LINES unless given.
+    let mut args = args;
+    if args.lean {
+        args.dedup = true;
+        args.max_lines = args.max_lines.or(Some(LEAN_MAX_LINES));
+    }
+
     // exactly one source: file / gcloud / bq
     let sources = [
         args.gcloud.is_some(),
@@ -1083,11 +1100,20 @@ fn main() {
         }
         sorted.truncate(20);
         sorted.sort_by(cmp);
-        eprintln!("\n=== LOG PATTERN STATISTICS ===");
-        for (p, c) in &sorted {
-            eprintln!("{:>7} | {}", c, p);
+        if args.json {
+            // Machine-readable survey: NDJSON on stdout, the agent's
+            // channel. Same top-20 + deterministic tie order as the
+            // stderr table.
+            for (p, c) in &sorted {
+                emit(&mut outbuf, &serde_json::json!({"pattern": p, "count": c}).to_string());
+            }
+        } else {
+            eprintln!("\n=== LOG PATTERN STATISTICS ===");
+            for (p, c) in &sorted {
+                eprintln!("{:>7} | {}", c, p);
+            }
+            eprintln!("==============================");
         }
-        eprintln!("==============================");
     }
 
     if let Some(sessions) = result.sessions {

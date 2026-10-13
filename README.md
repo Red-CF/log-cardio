@@ -1,8 +1,9 @@
 # cardio
 
-Fast Rust CLI that trims the fat from logs — fewer tokens for LLM agents, faster
-search and manipulation for developers. Logs can be GBs: cardio streams line by
-line with near-constant memory (Bloom-filter dedup, capped stats/trace maps).
+Fast Rust CLI that trims the fat from logs — fewer tokens for LLM agents.
+Logs can be GBs: cardio streams line by line with near-constant memory
+(Bloom-filter dedup, capped stats/trace maps). Agents can fetch logs
+themselves (`--gcloud`, `--bq`) and get context with `cardio --agent-md`.
 
 ## Install
 
@@ -13,11 +14,16 @@ cargo install --path .
 ## Input
 
 ```bash
-cardio app.log                      # file
-tail -f app.log | cardio            # stdin
-cardio --gcloud 'resource.type=gce_instance'   # fetch straight from Cloud Logging
-cardio --bq 'SELECT FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp, text FROM prod.traces'   # fetch via BigQuery SQL
+cardio --lean app.log                       # file — the agent mode
+cardio --lean --gcloud 'resource.type=gce_instance'
+cardio --lean --bq 'SELECT FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp, text FROM prod.traces'
+cardio app.log                              # raw pipeline, no dedup/cap
 ```
+
+> **⚠ `--lean`/`--dedup` drop unique lines (~1% false positives).** The
+> Bloom filter can't tell a repeat from a hash collision — the cheapest
+> 1% is noise, but if the line you need might be THE answer, run without
+> them. Cap default under `--lean` is 2000 lines (`--max-lines` overrides).
 
 gcloud mode pushes `--since`/`--until` bounds into the server-side filter
 (timestamp clauses), so it downloads only the window you asked for. Without
@@ -50,10 +56,10 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | Flag | Effect |
 |---|---|
 | `[file]` | Log file. Omitted → stdin. |
+| `--lean` | Agent mode: trim + `--dedup` + `--max-lines 2000` in one command. |
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
-| `[file]` | Log file. Omitted → stdin. |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
-| `--dedup` | Drop repeated whole lines (Bloom filter, ~1% false positives, memory constant). |
+| `--dedup` | Drop repeated whole lines (Bloom filter — **~1% false positives, and they're unique lines thrown away**). |
 | `--max-lines N` | Cap output (events in `--trace`/`--summary` mode). |
 | `--json` | NDJSON output: `{"index","content"}` per line; with `--trace` → `{"id","events"}`; with `--summary` → `{"id","count","first","last"}`. |
 | `--since TS` | Timestamp >= this. ISO (`2026-10-09T05:00:00`) or `YYYY-MM-DD` (= day start). |
@@ -61,7 +67,7 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | `--trace REGEX` | Group lines by captured ID, e.g. `"request_id=([a-z0-9-]+)"`; sessions printed at the end. |
 | `--summary` | With `--trace`: compact per-ID map — event count + first/last event, IDs preserved. |
 | `--bq SQL` | Run the bq CLI with this SQL (CSV) and process its rows. One source only. |
-| `--stats` | Survey mode: top-20 pattern frequencies to stderr, no stream. |
+| `--stats` | Survey mode: top-20 pattern frequencies to stderr, no stream. `--stats --json` → NDJSON {"pattern","count"} on stdout. |
 | `--config FILE` | TOML: `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
 
 ## Time handling
