@@ -443,3 +443,94 @@ fn impossible_date_bound_is_rejected() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not a full ISO"), "got: {err:?}");
 }
+
+#[test]
+fn frac_on_minutes_bound_is_rejected_as_noop() {
+    // a frac on minutes is no real grammar — rejected like any invalid ts
+    // (warned no-op, every line passes), never mis-canonicalized
+    let path = fixture("2026-10-09T12:34:30 event\n");
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args([path.0.to_string_lossy().as_ref(), "--since", "2026-10-09T12:34.5"])
+        .output()
+        .expect("cardio binary should run");
+    assert!(
+        out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not a full ISO"), "got: {err:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("event"), "no-op bound keeps lines, got: {stdout:?}");
+}
+
+#[test]
+fn last_year_bound_keeps_end_day() {
+    // --until 9999-12-31 must keep the whole day: the wrapped "10000-…"
+    // string would sort BEFORE "9999-…", the sentinel sorts above it
+    let path = fixture("9999-12-31T22:00:00Z late\n9999-12-30T10:00:00Z earlier\n");
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "9999-12-31"]);
+
+    assert!(out.contains("late"), "end day survives the last --until, got: {out:?}");
+    assert!(out.contains("earlier"), "got: {out:?}");
+}
+
+#[test]
+fn over_max_frac_line_collapses_to_max_shape() {
+    // 20-digit line fracs truncate to MAX_FRAC: their first 19 digits must
+    // still order the line — both sit just under 12:34:46, and both collapse
+    // onto the same 19-digit instant (documented ceiling: >19-digit fracs
+    // line-vs-line order blurs)
+    let path = fixture(
+        "2026-10-09T12:34:45.99999999999999999995 short\n2026-10-09T12:34:45.99999999999999999999 long\n2026-10-09T12:34:46 later\n",
+    );
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--until", "2026-10-09T12:34:46"]);
+
+    assert!(out.contains("short"), "20-digit ..995 stays under :46, got: {out:?}");
+    assert!(out.contains("long"), "20-digit ..999 stays under :46, got: {out:?}");
+    assert!(!out.contains("later"), ":46.0 fails the exclusive bound, got: {out:?}");
+
+    let out = cardio(&[
+        path.0.to_string_lossy().as_ref(),
+        "--until", "2026-10-09T12:34:45.9999999999999999999",
+    ]);
+    assert!(
+        !out.contains("short") && !out.contains("long"),
+        "both truncations collapse onto the equal instant, got: {out:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn gcloud_filter_embeds_plain_seconds() {
+    // the server literal must strip the canonical 19-digit pad ('…T00:
+    // 00:00', no frac tail) instead of betting the fetch on its parser
+    let fake = std::env::temp_dir().join(format!(
+        "cardio_fakegc_{}",
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join("gcloud");
+    std::fs::write(&script, "#!/bin/sh\necho \"$3\" >&2\n") // argv: logging read FILTER
+        .expect("write fake gcloud");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake gcloud executable");
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--gcloud", "resource.type=x", "--since", "2026-10-09", "--until", "2026-10-09T12:34:45.5"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    assert!(
+        out.status.success(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // the echo lands on the fake's stderr: cardio's stdout would have the
+    // ts trimmed out of it by the normal pipeline
+    let echo = String::from_utf8_lossy(&out.stderr);
+    assert!(echo.contains("timestamp>=\"2026-10-09T00:00:00\""), "got: {echo:?}");
+    assert!(echo.contains("timestamp<\"2026-10-09T12:34:45.5\""), "got: {echo:?}");
+    assert!(!echo.contains("0000000000"), "bare 19-digit pad leaked to the server: {echo:?}");
+}

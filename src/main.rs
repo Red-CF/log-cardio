@@ -89,11 +89,13 @@ fn compile_regex(pattern: &str, source: &str) -> Regex {
     })
 }
 
-/// Full ISO structure: date, optional time (hh(:mm(:ss)?)?), optional
-/// fractional seconds + tz offset. ponytail: structural + calendar-sanity
-/// only — exact days-in-month and tz semantics stay out (chrono if needed).
+/// Full ISO structure: date, optional time (hh:mm(:ss)?)?, optional
+/// fractional seconds (SECONDS only — a frac on minutes is not a real
+/// log grammar and is rejected like any other invalid ts) + tz offset.
+/// ponytail: structural + calendar-sanity only — exact days-in-month
+/// and tz semantics stay out (chrono if needed).
 static FULL_ISO_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}(:\d{2}){1,2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$")
+    Regex::new(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$")
         .unwrap()
 });
 
@@ -144,23 +146,35 @@ fn flush(outbuf: &mut Sink) {
 const MAX_FRAC: usize = 19;
 const ZEROS: &str = "0000000000000000000"; // MAX_FRAC zeros
 
-static TZ_SUFFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
-    // tz suffix allowed by FULL_ISO_RE: Z or ±dd(:?dd)?
-    Regex::new(r"(?:Z|[+-]\d{2}:?\d{2})$").unwrap()
-});
-
-/// Digit run after the '.' in a fractional instant: "45.5" → Some(1),
-/// no dot → None. The run itself (length), not padability.
-fn short_frac(s: &str) -> Option<usize> {
-    let i = s.find('.')?;
-    Some(s[i + 1..].bytes().take_while(|b| b.is_ascii_digit()).count())
+/// tz-naive suffix strip (call AFTER space→'T'): trailing 'Z' or a
+/// ±dd(:?dd)? tail. Byte checks, not regex — every line passes here.
+/// The ':' check keeps the ± branch off plain instants (dates carry
+/// '-' too, but never a ':' three bytes from the end).
+fn strip_tz(out: &mut String) {
+    let n = out.len();
+    if out.ends_with('Z') {
+        out.truncate(n - 1);
+        return;
+    }
+    if n < 6 {
+        return;
+    }
+    let b = out.as_bytes();
+    let sign = |i: usize| b[i] == b'+' || b[i] == b'-';
+    let digits = |r: std::ops::Range<usize>| b[r].iter().all(|c| c.is_ascii_digit());
+    let six = n - 6;
+    let five = n - 5;
+    if sign(six) && digits(six + 1..n - 3) && b[n - 3] == b':' && digits(n - 2..n) {
+        out.truncate(six); // ±dd:dd
+    } else if sign(five) && digits(five + 1..n) {
+        out.truncate(five); // ±dddd
+    }
 }
 
 /// THE single canonical-for-compare writer: space→'T' (" " < "T" would
 /// mis-order), the tz suffix strips whole (compare is tz-naive — a '+'
 /// or 'Z' tail itself would mis-order equal instants), date-only = day
-/// start, minute precision pads to ":00", a frac on MINUTES converts to
-/// seconds (".5" = 30s, not ":00.5"), and every instant ends with
+/// start, minute precision pads to ":00", and every instant ends with
 /// MAX_FRAC frac digits. Lines and bounds both land here — one
 /// invariant, no drift.
 fn to_canonical(s: &str, out: &mut String) {
@@ -172,31 +186,13 @@ fn to_canonical(s: &str, out: &mut String) {
     } else {
         out.push_str(s);
     }
-    if let Some(m) = TZ_SUFFIX_RE.find(&out) {
-        out.truncate(m.start());
-    }
+    strip_tz(out);
     if out.len() == 10 {
         // date-only = day start (bounds: --until handles its own convention)
         out.push_str("T00:00:00");
         out.push('.');
         out.push_str(ZEROS);
         return;
-    }
-    // "T12:34.5": FULL_ISO_RE admits a frac on MINUTES — it is fractional
-    // minutes (.5 = 30s), not sub-second: convert before the minute pad
-    // would misread it as ":00.5"
-    {
-        let b = out.as_bytes();
-        if out.len() > 16 && b[10] == b'T' && b[13] == b':' && b[16] == b'.' {
-            let run = short_frac(&out).unwrap_or(0);
-            let secs = if run > 0 && run <= 19 {
-                let num: u64 = out[17..17 + run].parse().unwrap_or(0);
-                60u64 * num / 10u64.pow(run as u32)
-            } else {
-                0
-            };
-            out.replace_range(16.., &format!(":{:02}", secs));
-        }
     }
     // is_full_iso guarantees at least HH:MM after 'T': partial iff byte 16
     // is not the ':' that would start seconds (nothing is left after the
@@ -269,6 +265,12 @@ fn next_day_start(date: &str) -> String {
         d = 1;
         m += 1;
         if m > 12 { m = 1; y += 1; }
+    }
+    if y > 9999 {
+        // 9999-12-31 + 1: no next day. A "10000-…" string would sort
+        // BEFORE "9999-…", so return a sentinel that sorts ABOVE every
+        // 9999-12-31 instant ('T' < U+10FFFF) — the whole end day is kept.
+        return format!("9999-12-31\u{10FFFF}");
     }
     format!("{:04}-{:02}-{:02}T00:00:00", y, m, d)
 }
@@ -445,6 +447,23 @@ fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) 
     (stdout, child)
 }
 
+/// Server-filter literal: canonical's 19-digit frac tail is pure padding —
+/// strip trailing zeros (an all-zero frac becomes plain seconds, so the
+/// fetch never bets on a parser accepting >9-digit fracs). The local
+/// canonical filter still applies the exact compare to returned entries.
+/// ponytail: nanosecond-max literal if GCP ever complains about more.
+fn server_ts(canonical: &str) -> &str {
+    let Some(i) = canonical.find('.') else {
+        return canonical;
+    };
+    let frac = canonical[i + 1..].trim_end_matches('0');
+    if frac.is_empty() {
+        &canonical[..i]
+    } else {
+        &canonical[..i + 1 + frac.len()]
+    }
+}
+
 /// Spawn gcloud / bq / open file / stdin. Returns the input source and any
 /// child fetcher we own. gcloud mode pushes canonical time bounds into the
 /// SERVER-side filter (valid ISO by is_full_iso) to avoid downloading months
@@ -458,12 +477,13 @@ fn make_reader(
 ) -> (Source, Option<(&'static str, Child)>) {
     if let Some(filter) = &args.gcloud {
         let mut gc_filter = filter.clone();
-        // bounds already canonicalized: no space separator remains
+        // bounds already canonicalized: no space separator remains; the
+        // embed takes padding's trailing zeros off (server_ts)
         if let Some(s) = since_valid {
-            gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", s));
+            gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", server_ts(s)));
         }
         if let Some(u) = until_valid {
-            gc_filter.push_str(&format!(" AND timestamp<\"{}\"", u));
+            gc_filter.push_str(&format!(" AND timestamp<\"{}\"", server_ts(u)));
         }
         let gc_args = vec![
             "logging".to_string(), "read".to_string(), gc_filter,
