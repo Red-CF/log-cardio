@@ -45,6 +45,24 @@ jobs:
       - run: cargo llvm-cov --lcov --output-path lcov.info
       - uses: codecov/codecov-action@v4
 
+  version:
+    # the merge gate: a PR must bump Cargo.toml above what crates.io has,
+    # or the merge button stays locked (the release job's auto-bump only
+    # covers the rare post-check race of two near-simultaneous merges)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: version must be new to crates.io
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          PUBLISHED=$(curl -sfL -A "log-cardio-ci" "https://crates.io/api/v1/crates/log-cardio/versions" | jq -r --arg v "$V" '[.[].num | select(. == $v)] | length')
+          [ -n "$PUBLISHED" ] || { echo "registry query failed — try again"; exit 1; }
+          if [ "$PUBLISHED" != "0" ]; then
+            echo "::error::log-cardio $V is already on crates.io — bump version in Cargo.toml before merging"
+            exit 1
+          fi
+
   release:
     # a merge to main ships the crate: publish the version the PR bumped in
     # Cargo.toml; if that version is already on crates.io (unbumped merge),
