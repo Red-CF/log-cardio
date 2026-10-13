@@ -11,9 +11,19 @@ themselves (`--gcloud`, `--bq`) and get context with `cardio --agent-md`.
 
 ## Install
 
+**With cargo** (installs the `cardio` binary):
+
 ```bash
-cargo install log-cardio   # installs the `cardio` binary
+cargo install log-cardio
 ```
+
+**Without cargo** (macOS/Linux — downloads the binary from the latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Red-CF/log-cardio/main/install.sh | sh
+```
+
+**Windows**: grab the `cardio-Windows-X64.exe` from the [releases page](https://github.com/Red-CF/log-cardio/releases) and put it on your `PATH`.
 
 Or from source:
 
