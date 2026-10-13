@@ -16,12 +16,18 @@ cargo install --path .
 cardio app.log                      # file
 tail -f app.log | cardio            # stdin
 cardio --gcloud 'resource.type=gce_instance'   # fetch straight from Cloud Logging
+cardio --bq 'SELECT text, timestamp FROM prod.traces'   # fetch via BigQuery SQL
 ```
 
 gcloud mode pushes `--since`/`--until` bounds into the server-side filter
 (timestamp clauses), so it downloads only the window you asked for. Without
 time bounds the query streams oldest-first — bound it with `--since` (e.g. an
 ISO timestamp 7 days back) if you only need recent entries.
+
+bq mode runs `bq query --format=csv` and every result row flows through the
+same pipeline (query/range/trace/summary/stats) — pull trace data with SQL
+and trim it in one step. bq's row limits still apply (cardio passes
+`--max_rows=10000000`).
 
 ## Flags
 
@@ -36,6 +42,7 @@ ISO timestamp 7 days back) if you only need recent entries.
 | `--until TS` | Timestamp < this. ISO, or `YYYY-MM-DD` (= NEXT-day start, so the end day is kept). |
 | `--trace REGEX` | Group lines by captured ID, e.g. `"request_id=([a-z0-9-]+)"`; sessions printed at the end. |
 | `--summary` | With `--trace`: compact per-ID map — event count + first/last event, IDs preserved. |
+| `--bq SQL` | Run the bq CLI with this SQL (CSV) and process its rows. One source only. |
 | `--stats` | Survey mode: top-20 pattern frequencies to stderr, no stream. |
 | `--config FILE` | TOML: `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
 

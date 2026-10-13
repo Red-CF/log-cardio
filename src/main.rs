@@ -59,6 +59,11 @@ struct Args {
     #[arg(long)]
     gcloud: Option<String>,
 
+    /// BigQuery SQL — runs the bq CLI (CSV output) and feeds rows into the
+    /// same pipeline (query/range/trace/summary/stats)
+    #[arg(long)]
+    bq: Option<String>,
+
     /// Path to TOML config file (timestamp_regex, boilerplate_regex, default_trace)
     #[arg(long)]
     config: Option<String>,
@@ -218,7 +223,8 @@ struct Pipeline {
     since_valid: Option<String>,
     until_valid: Option<String>,
     range_filter: bool,
-    gc: bool,
+    /// child-fetcher tool name ("gcloud"/"bq") — blank counts/notes gated on it
+    child_tool: Option<&'static str>,
     ts_norm: String,
     warned_non_iso: bool,
     read_error: Option<io::Error>,
@@ -249,7 +255,7 @@ impl Pipeline {
 
             // gcloud entries with neither textPayload nor jsonPayload.message
             // render as blank lines: count them so vanished records are visible
-            if self.gc && line.trim().is_empty() {
+            if self.child_tool.is_some() && line.trim().is_empty() {
                 self.empty_entries += 1;
             }
 
@@ -299,7 +305,7 @@ fn make_reader(
     args: &Args,
     since_valid: &Option<String>,
     until_valid: &Option<String>,
-) -> (Box<dyn BufRead>, Option<Child>) {
+) -> (Box<dyn BufRead>, Option<Child>, &'static str) {
     if let Some(filter) = &args.gcloud {
         let mut gc_filter = filter.clone();
         // bounds already canonicalized: no space separator remains
@@ -326,15 +332,36 @@ fn make_reader(
                 exit(1);
             });
         let stdout: ChildStdout = child.stdout.take().expect("gcloud stdout");
-        (Box::new(BufReader::new(stdout)), Some(child))
+        (Box::new(BufReader::new(stdout)), Some(child), "gcloud")
+    } else if let Some(sql) = &args.bq {
+        // ponytail: csv = one row per line for the pipeline; --max_rows
+        // pushed at 10M because bq silently caps selects at 1000 rows.
+        let bq_args = vec![
+            "query".to_string(),
+            "--use_legacy_sql=false".to_string(),
+            "--format=csv".to_string(),
+            "--max_rows=10000000".to_string(),
+            sql.clone(),
+        ];
+        let mut child = Command::new("bq")
+            .args(&bq_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to execute bq: {}. Is the bq CLI installed?", e);
+                exit(1);
+            });
+        let stdout: ChildStdout = child.stdout.take().expect("bq stdout");
+        (Box::new(BufReader::new(stdout)), Some(child), "bq")
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {
             eprintln!("Error opening file {}: {}", path, e);
             exit(1);
         });
-        (Box::new(BufReader::new(file)), None)
+        (Box::new(BufReader::new(file)), None, "")
     } else {
-        (Box::new(BufReader::new(io::stdin())), None)
+        (Box::new(BufReader::new(io::stdin())), None, "")
     }
 }
 
@@ -500,8 +527,17 @@ fn emit_sessions(sessions: &BTreeMap<String, Session>, json: bool, outbuf: &mut 
 fn main() {
     let args = Args::parse();
 
-    if args.gcloud.is_some() && args.file_path.is_some() {
-        eprintln!("Error: pass either a file path or --gcloud, not both.");
+    // exactly one source: file / gcloud / bq
+    let sources = [
+        args.gcloud.is_some(),
+        args.bq.is_some(),
+        args.file_path.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if sources > 1 {
+        eprintln!("Error: pass only one source: a file path, --gcloud, or --bq.");
         exit(1);
     }
 
@@ -578,7 +614,9 @@ fn main() {
         .filter(|u| is_full_iso(u)).map(|u| canonical_until(u));
     let range_filter = since_valid.is_some() || until_valid.is_some();
 
-    let (reader, mut gc_child) = make_reader(&args, &since_valid, &until_valid);
+    let (reader, child, child_tool) = make_reader(&args, &since_valid, &until_valid);
+    let mut gc_child = child;
+    let child_tool = if child_tool.is_empty() { None } else { Some(child_tool) };
 
     let mut proc = Pipeline {
         reader,
@@ -586,7 +624,7 @@ fn main() {
         re_boilerplate,
         query: args.query.clone(),
         range_filter,
-        gc: gc_child.is_some(),
+        child_tool,
         since_valid,
         until_valid,
         ts_norm: String::new(),
@@ -661,8 +699,10 @@ fn main() {
     if result.dedup_inserts > 10_000_000 {
         eprintln!("Warning: --dedup exceeded 10M unique lines; bloom filter is saturated and unique lines may be dropped as false duplicates.");
     }
-    if empty_entries > 0 {
-        eprintln!("Note: {} gcloud entr{} had no textPayload/message and were skipped.", empty_entries, if empty_entries == 1 { "y" } else { "ies" });
+    if let Some(tool) = child_tool {
+        if empty_entries > 0 {
+            eprintln!("Note: {} empty entr{} from {} were skipped.", empty_entries, if empty_entries == 1 { "y" } else { "ies" }, tool);
+        }
     }
     if result.stats_capped {
         eprintln!("Warning: --stats reached its {} unique-pattern cap; later patterns untracked (existing counts are complete).", MAX_STATS_PATTERNS);
@@ -706,10 +746,10 @@ fn main() {
         match child.wait() {
             Ok(status) if !status.success() => {
                 if early_cut {
-                    eprintln!("Note: gcloud stream cut early (--max-lines).");
+                    eprintln!("Note: {} stream cut early (--max-lines).", child_tool.unwrap_or("child"));
                 } else {
-                    // Propagate: scripts piping cardio must see gcloud failures
-                    eprintln!("Error: gcloud exited with {}", status);
+                    // Propagate: scripts piping cardio must see fetch failures
+                    eprintln!("Error: {} exited with {}", child_tool.unwrap_or("child"), status);
                     exit(1);
                 }
             }
