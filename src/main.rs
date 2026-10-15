@@ -523,7 +523,12 @@ fn main() {
         // closed, main parked in wait()).
         let status;
         loop {
-            match child.lock().unwrap().try_wait() {
+            // scoped block: the MutexGuard must NOT outlive try_wait — a
+            // guard held across the sleep arm would keep the watchdog
+            // waiting on the lock forever (match temporaries live until
+            // the arms complete, so a naked match scrutinee deadlocks)
+            let probed = { child.lock().unwrap().try_wait() };
+            match probed {
                 Ok(Some(s)) => { status = Some(s); break; }
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
                 Err(e) => {
