@@ -48,7 +48,8 @@ pub(crate) struct LogEntry {
 pub(crate) struct Pipeline {
     pub(crate) source: crate::source::Source,
     pub(crate) re_timestamp: Regex,
-    pub(crate) re_boilerplate: Regex,
+    /// combined ts|boilerplate strip regex — the trim workhorse (one pass)
+    pub(crate) re_trim: Regex,
     pub(crate) query: Option<String>,
     pub(crate) since_valid: Option<String>,
     pub(crate) until_valid: Option<String>,
@@ -59,6 +60,10 @@ pub(crate) struct Pipeline {
     /// (real-agent feedback: the strip ate the bq timestamp column, losing
     /// temporal order; raw must hand over exactly what the source gave)
     pub(crate) verbatim: bool,
+    /// --max-field-len: each tab-delimited field (whole line when there
+    /// are no tabs) cuts to this many chars with a "…" marker — huge
+    /// XML/bodies don't need SQL SUBSTR hacks
+    pub(crate) max_field_len: Option<usize>,
     pub(crate) ts_norm: String,
     pub(crate) warned_non_iso: bool,
     pub(crate) read_error: Option<io::Error>,
@@ -152,7 +157,7 @@ impl Pipeline {
             }
 
             if self.verbatim {
-                return Some((self.line_no, line.to_string()));
+                return Some((self.line_no, self.clamp_fields(line)));
             }
 
             // bq CLI progress chatter ("Waiting on bqjob_r… (…)") can reach
@@ -163,8 +168,11 @@ impl Pipeline {
                 continue;
             }
 
-            let trimmed = self.re_timestamp.replace_all(line, "");
-            let trimmed = self.re_boilerplate.replace_all(&trimmed, "");
+            // one combined pass: ts + boilerplate as one alternation, both
+            // replaced with "" — identical result to the old two-pass trim
+            // at half the regex cost (the visible lean/raw gap was ~0.6s
+            // per M lines; bench.sh tracks this number)
+            let trimmed = self.re_trim.replace_all(line, "");
             let final_line = trimmed.trim();
             if final_line.is_empty() {
                 // A fetcher row/entry that contributes nothing: count it so
@@ -174,9 +182,38 @@ impl Pipeline {
                 if self.child_tool.is_some() { self.empty_entries += 1; }
                 continue;
             }
-            return Some((self.line_no, final_line.to_string()));
+            return Some((self.line_no, self.clamp_fields(final_line)));
         }
     }
+
+    /// Field cap, applied only when the line is over budget (no alloc on
+    /// the common path). Tab-delimited segments cut individually;
+    /// tab-less lines count as one field. "…" marks the cut.
+    fn clamp_fields(&self, line: &str) -> String {
+        let Some(n) = self.max_field_len else {
+            return line.to_string();
+        };
+        if line.contains('\t') {
+            line.split('\t')
+                .map(|f| clamp_one(f, n))
+                .collect::<Vec<_>>()
+                .join("\t")
+        } else {
+            clamp_one(line, n)
+        }
+    }
+}
+
+/// One field to at most `n` chars ("…" appended when cut). ≤n costs one
+/// alloc only for the copy — acceptable at the return site (the trimmed
+/// path already allocates).
+fn clamp_one(field: &str, n: usize) -> String {
+    if field.chars().count() <= n {
+        return field.to_string();
+    }
+    let mut out: String = field.chars().take(n).collect();
+    out.push('…');
+    out
 }
 
 /// Stream mode: dedup + emit as we go; returns (dedup insertions,

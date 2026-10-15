@@ -90,6 +90,9 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | `--max-bytes-billed N` | bq-only: hard bytes-billed cap — the query errors instead of scanning multi-TB tables. |
 | `--dry-run` | bq-only: cost estimate only — runs `bq query --dry_run`, no rows read. |
 | `--bq-args "--flag=..."` | bq-only: raw bq CLI flags passthrough (whitespace-split, no quotes inside). |
+| `--timeout SECS` | bq/gcloud only: kill a hung fetcher after SECS (its job id stays in stderr). |
+| `--top N` | summary mode: keep only the biggest N sessions (event count). |
+| `--max-field-len N` | cut any field (or line) longer than N chars with a "…" marker. |
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
 | `--dedup` | Drop repeated whole lines (Bloom filter — **~1% false positives, and they're unique lines thrown away**). |
@@ -100,8 +103,16 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | `--trace REGEX` | Group lines by captured ID, e.g. `"request_id=([a-z0-9-]+)"`; sessions printed at the end. |
 | `--summary` | With `--trace`: compact per-ID map — event count + first/last event, IDs preserved. |
 | `--bq SQL` | Run the bq CLI with this SQL (CSV) and process its rows. One source only. |
-| `--stats` | Survey mode: top-20 pattern frequencies to stderr, no stream. `--stats --json` → NDJSON {"pattern","count"} on stdout. |
+| `--stats` | Survey mode: top-20 pattern frequencies to stderr, no stream. Digit runs fold to `#` first (`sid=123` ≡ `sid=456`); `--stats --json` → NDJSON {"pattern","count"} on stdout. |
 | `--config FILE` | TOML: `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
+
+## Performance
+
+`./bench.sh` (or `N=1000000 ./bench.sh`) times every mode on a synthetic
+1M-line log — hyperfine when installed, a monotonic fallback otherwise.
+Current numbers (M1, release build): lean ≈ 0.5 s, raw ≈ 0.2 s,
+`--stats` ≈ 0.6 s per 1M lines (~105 MB/s lean) — the trim is one combined
+regex pass. For gcloud/bq sources the network dominates anyway.
 
 ## Time handling
 

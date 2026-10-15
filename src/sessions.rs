@@ -105,41 +105,70 @@ pub(crate) fn collect_sessions(
 }
 
 /// Emit collected sessions — one JSON object or one text block per ID.
-pub(crate) fn emit_sessions(sessions: &BTreeMap<String, Session>, json: bool, outbuf: &mut Sink) {
-    if json {
-        for (id, s) in sessions {
-            let value = match s {
-                Session::Full(lines) => serde_json::json!({"id": id, "events": lines}),
-                Session::Summary(count, first, last) => serde_json::json!({
-                    "id": id, "count": count, "first": first, "last": last
-                }),
-            };
-            let out = serde_json::to_string(&value).unwrap();
-            emit(outbuf, &out);
-        }
-    } else {
-        let summary = sessions.values().next()
-            .is_some_and(|s| matches!(s, Session::Summary(..)));
+/// `--top N` keeps only the biggest sessions (by event count) and returns
+/// how many were dropped for the honest note: with hundreds of IDs the
+/// compact map itself was still ~80 tokens per ID, unread (real-agent
+/// feedback: 144 sessions = 11.6k tokens, none read).
+pub(crate) fn emit_sessions(
+    sessions: &BTreeMap<String, Session>,
+    top: Option<usize>,
+    json: bool,
+    outbuf: &mut Sink,
+) -> usize {
+    // size = events kept per session (summary count / full lines)
+    let size = |s: &Session| match s {
+        Session::Full(v) => v.len(),
+        Session::Summary(n, ..) => *n,
+    };
+    let mut view: Vec<(&String, &Session)> = sessions.iter().collect();
+    view.sort_by_key(|(_id, s)| std::cmp::Reverse(size(s)));
+    let dropped = top.map_or(0, |n| view.len().saturating_sub(n));
+    if dropped > 0 {
+        let n = top.unwrap_or(0);
+        emit(outbuf, &format!(
+            "\n=== showing the top {} of {} sessions ({} smaller dropped; --top N adjusts) ===",
+            n, view.len(), dropped
+        ));
+        view.truncate(n);
+    }
+    if !json {
+        let summary = view.iter().any(|(_, s)| matches!(s, Session::Summary(..)));
         if summary {
-            emit(outbuf, &format!("\n=== TRACE SUMMARY: {} sessions ===", sessions.len()));
+            emit(outbuf, &format!("\n=== TRACE SUMMARY: {} sessions ===", view.len()));
         }
-        for (id, s) in sessions {
-            match s {
-                Session::Full(lines) => {
-                    emit(outbuf, &format!("\n--- [{}] ---\n{}", id, lines.join("\n")));
-                }
-                Session::Summary(count, first, last) => {
-                    // 1-event session: first == last — print once, singular label
-                    let body = if *count == 1 {
-                        first.to_string()
-                    } else {
-                        format!("{}\n{}", first, last)
-                    };
-                    emit(outbuf, &format!(
-                        "--- [{}] {} event{} ---\n{}", id, count,
-                        if *count == 1 { "" } else { "s" }, body
-                    ));
-                }
+    }
+    for (id, s) in &view {
+        emit_session(id, s, json, outbuf);
+    }
+    dropped
+}
+
+fn emit_session(id: &str, s: &Session, json: bool, outbuf: &mut Sink) {
+    if json {
+        let value = match s {
+            Session::Full(lines) => serde_json::json!({"id": id, "events": lines}),
+            Session::Summary(count, first, last) => serde_json::json!({
+                "id": id, "count": count, "first": first, "last": last
+            }),
+        };
+        let out = serde_json::to_string(&value).unwrap();
+        emit(outbuf, &out);
+    } else {
+        match s {
+            Session::Full(lines) => {
+                emit(outbuf, &format!("\n--- [{}] ---\n{}", id, lines.join("\n")));
+            }
+            Session::Summary(count, first, last) => {
+                // 1-event session: first == last — print once, singular label
+                let body = if *count == 1 {
+                    first.to_string()
+                } else {
+                    format!("{}\n{}", first, last)
+                };
+                emit(outbuf, &format!(
+                    "--- [{}] {} event{} ---\n{}", id, count,
+                    if *count == 1 { "" } else { "s" }, body
+                ));
             }
         }
     }

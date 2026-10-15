@@ -17,7 +17,8 @@ use pipeline::{Pipeline, Sink, flush, run_stream};
 use source::make_reader;
 use std::collections::HashMap;
 use std::io;
-use std::process::{exit};
+use std::process::exit;
+use std::sync::LazyLock;
 use timestamps::{TRIM_BODY, canonical_bound, is_full_iso};
 
 /// --stats survey cap: unique patterns tracked before the counter stops
@@ -105,6 +106,22 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) bq_args: Option<String>,
 
+    /// Kill the gcloud/bq fetcher after this many seconds — a hung child
+    /// (a 20-minute silent bq was seen for real) otherwise blocks forever;
+    /// its job id stays in stderr for later retrieval
+    #[arg(long)]
+    pub(crate) timeout: Option<u64>,
+
+    /// Keep only the biggest N sessions (event count); the rest drop with
+    /// a note. With hundreds of IDs even the summary map overflows context
+    #[arg(long)]
+    pub(crate) top: Option<usize>,
+
+    /// Cut any field (or whole line without tabs) after N chars with an
+    /// "…" marker — huge XML bodies don't need SQL SUBSTR hacks
+    #[arg(long)]
+    pub(crate) max_field_len: Option<usize>,
+
     /// Path to TOML config file (timestamp_regex, boilerplate_regex, default_trace)
     #[arg(long)]
     pub(crate) config: Option<String>,
@@ -135,17 +152,31 @@ fn compile_regex(pattern: &str, source: &str) -> Regex {
     })
 }
 
+/// --stats folds digit runs to '#' before counting: "sid=123" and
+/// "sid=456" are ONE pattern to the survey, not two (three agents hit
+/// per-UUID floods that told them nothing). Dedup keeps exact lines.
+static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new("[0-9]+").unwrap());
+
 /// Stats mode: survey the whole file; returns counts + whether capped.
 fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
     let mut stats_map: HashMap<String, usize> = HashMap::new();
+    let mut key_buf = String::new(); // reused fold buffer, read via `key` alias
     let mut capped = false;
     while let Some((_, line)) = proc.next_trimmed() {
         // get_mut fast path — no String alloc for a line already seen.
         // Cap gates only new insertions; existing counters keep advancing.
-        if let Some(c) = stats_map.get_mut(&line) {
+        let fold = line.bytes().any(|b| b.is_ascii_digit());
+        let key: &str = if fold {
+            key_buf.clear();
+            key_buf.push_str(&DIGIT_RUN.replace_all(&line, "#"));
+            &key_buf
+        } else {
+            &line
+        };
+        if let Some(c) = stats_map.get_mut(key) {
             *c += 1;
         } else if stats_map.len() < MAX_STATS_PATTERNS {
-            stats_map.insert(line, 1);
+            stats_map.insert(key.to_string(), 1);
         } else {
             capped = true;
         }
@@ -215,6 +246,10 @@ fn main() {
             eprintln!("Error: {flag} only works with --bq.");
             exit(2);
         }
+    if args.timeout.is_some() && args.bq.is_none() && args.gcloud.is_none() {
+        eprintln!("Error: --timeout only works with --bq or --gcloud.");
+        exit(2);
+    }
 
     let config = args.config.as_ref().map(|p| {
         let s = std::fs::read_to_string(p).unwrap_or_else(|e| {
@@ -235,9 +270,11 @@ fn main() {
         config.timestamp_regex.as_deref().unwrap_or(&default_ts),
         "config timestamp_regex",
     );
-    let re_boilerplate = compile_regex(
-        config.boilerplate_regex.as_deref().unwrap_or(r"(?i)\b(INFO|DEBUG|TRACE)\b"),
-        "config boilerplate_regex",
+    let boilerplate = config.boilerplate_regex.as_deref().unwrap_or(r"(?i)\b(INFO|DEBUG|TRACE)\b");
+    // combined strip = one regex pass per line (ts | boilerplate → "")
+    let re_trim = compile_regex(
+        &format!("(?:{})|({})", default_ts, boilerplate),
+        "trim (timestamp | boilerplate)",
     );
     let trace_re = args.trace.as_ref().or(config.default_trace.as_ref())
         .map(|p| {
@@ -281,16 +318,35 @@ fn main() {
 
     let (reader, fetched_child) = make_reader(&args, &since_valid, &until_valid);
     let child_tool = fetched_child.as_ref().map(|(t, _)| *t);
-    let mut child = fetched_child.map(|(_, c)| c);
+    // Shared with the watchdog thread: main blocks on reads (not on the
+    // mutex), so the watchdog can lock freely and kill a hung child.
+    let child = fetched_child.map(|(_, c)| std::sync::Arc::new(std::sync::Mutex::new(c)));
+    if let (Some(secs), Some(arc)) = (args.timeout, &child) {
+        let watchdog = std::sync::Arc::clone(arc);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let Ok(mut c) = watchdog.lock() else { return };
+            match c.try_wait() {
+                // reaped or gone: nothing to kill (kill on a reaped pid could
+                // hit an unrelated process)
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => {
+                    let _ = c.kill();
+                    eprintln!("Error: fetcher killed after --timeout {}s (its job id is visible in the output above).", secs);
+                }
+            }
+        });
+    }
 
     let mut proc = Pipeline {
         source: reader,
         re_timestamp,
-        re_boilerplate,
+        re_trim,
         query: args.query.clone(),
         range_filter,
         child_tool,
         verbatim: args.raw,
+        max_field_len: args.max_field_len,
         since_valid,
         until_valid,
         ts_norm: String::new(),
@@ -394,6 +450,13 @@ fn main() {
         && empty_entries > 0 {
             eprintln!("Note: {} empty entr{} from {} were skipped.", empty_entries, if empty_entries == 1 { "y" } else { "ies" }, tool);
         }
+    // Real-agent feedback: an empty result looked like a failure because
+    // nothing said otherwise. Every fetcher run states its volume so 0 rows
+    // has a witness — the job id is already in stderr from the child.
+    if let Some(tool) = child_tool
+        && stopped_at_line > 0 {
+            eprintln!("Note: {} streamed {} line{}.", tool, stopped_at_line, if stopped_at_line == 1 { "" } else { "s" });
+        }
     if result.stats_capped {
         eprintln!("Warning: --stats reached its {} unique-pattern cap; later patterns untracked (existing counts are complete).", MAX_STATS_PATTERNS);
     }
@@ -431,17 +494,24 @@ fn main() {
     }
 
     if let Some(sessions_map) = result.sessions {
-        emit_sessions(&sessions_map, args.json, &mut outbuf);
+        let dropped = emit_sessions(&sessions_map, args.top, args.json, &mut outbuf);
+        if dropped > 0 {
+            eprintln!(
+                "Note: {} smaller session{} dropped (--top {}).",
+                dropped, if dropped == 1 { "" } else { "s" }, args.top.unwrap_or(0)
+            );
+        }
     }
     flush(&mut outbuf);
 
-    // We cut the stream early (--max-lines): kill gcloud outright. Rust
-    // ignores SIGPIPE and children inherit it, so gcloud would die on EPIPE
-    // with a nonzero exit — reported as a failure we caused.
+    // We cut the stream early (--max-lines / --timeout): kill the fetcher
+    // outright. Rust ignores SIGPIPE and children inherit it, so gcloud
+    // would die on EPIPE with a nonzero exit — reported as a failure we
+    // caused.
     if early_cut
-        && let Some(child) = child.as_mut() { let _ = child.kill(); }
-    if let Some(child) = child.as_mut() {
-        match child.wait() {
+        && let Some(child) = &child { let _ = child.lock().unwrap().kill(); }
+    if let Some(child) = &child {
+        match child.lock().unwrap().wait() {
             Ok(status) if !status.success() => {
                 if early_cut {
                     // already reported above; ignore the failure we caused

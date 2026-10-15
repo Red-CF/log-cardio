@@ -771,6 +771,117 @@ fn bq_flags_error_without_bq() {
     assert!(err.contains("only works with --bq"), "usage error missing: {err:?}");
 }
 
+#[test]
+fn trace_json_full_sessions_preserve_every_event() {
+    let path = fixture(
+        "2026-10-09T12:00:00Z req_id=a start\n\
+         2026-10-09T12:00:01Z req_id=a end\n\
+         2026-10-09T12:00:02Z req_id=b solo\n",
+    );
+    let out = cardio(&[path.0.to_string_lossy().as_ref(), "--trace", "req_id=([a-z])", "--json"]);
+    let a: serde_json::Value = {
+        let line = out.lines().find(|l| l.contains("\"id\":\"a\"")).expect("session a line");
+        serde_json::from_str(line).expect("session a parses as JSON")
+    };
+    let events = a["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2, "every event of the session survives: {a:?}");
+    assert!(events[0].as_str().unwrap().contains("start"), "first event is a start: {a:?}");
+}
+
+#[test]
+fn stdin_source_works_without_a_file() {
+    use std::io::Write as _;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("cardio spawned");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"2026-10-09T12:00:00Z INFO via stdin\n")
+        .expect("stdin write");
+    let out = child.wait_with_output().expect("cardio waits");
+    assert!(out.status.success(), "exited {}: {}", out.status, String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("via stdin"), "stdin read: {stdout:?}");
+}
+
+#[test]
+fn stats_folds_digit_runs_into_one_pattern() {
+    let path = fixture(
+        "op sid=123 ok\nop sid=456 ok\nop sid=789 ok\nplain line\n",
+    );
+    let (out, _) = cardio_out(&[path.0.to_string_lossy().as_ref(), "--stats", "--json"]);
+    let patterns: Vec<String> = out.lines().map(String::from).collect();
+    assert!(
+        patterns.iter().any(|p| p.contains("\"pattern\":\"op sid=# ok\""))
+            && patterns.iter().any(|p| p.contains("\"count\":3")),
+        "digit runs fold to one pattern: {patterns:?}"
+    );
+    assert!(!patterns.iter().any(|p| p.contains("op sid=1")), "no per-UUID lines: {patterns:?}");
+}
+
+#[cfg(unix)]
+fn fake_bq_status(script_body: &str, args: &[&str]) -> Option<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = std::env::temp_dir().join(format!(
+        "cardio_fakebqs_{}",
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    std::fs::write(fake.join("bq"), script_body).expect("write fake bq");
+    std::fs::set_permissions(fake.join("bq"), std::fs::Permissions::from_mode(0o755))
+        .expect("make fake bq executable");
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(args)
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "expected failure got success: {err:?}");
+    assert!(err.contains("bq exited"), "fetcher failure must propagate: {err:?}");
+    Some(())
+}
+
+#[cfg(unix)]
+#[test]
+fn fetcher_failure_exits_nonzero() {
+    fake_bq_status(
+        "#!/bin/sh\necho \"timestamp,text\nevent one\n\"\necho job_abc >&2\nexit 1\n",
+        &["--bq", "SELECT 1", "--raw"],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn timeout_kills_a_hung_fetcher() {
+    // child sleeps forever after printing a row: --timeout 1 must kill it
+    // and fail the run honestly
+    fake_bq_status(
+        "#!/bin/sh\necho \"timestamp,text\nevent one\n\"\nsleep 30\n",
+        &["--bq", "SELECT 1", "--raw", "--timeout", "1"],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn timeout_errors_without_a_fetcher() {
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--timeout", "5"])
+        .output()
+        .expect("cardio binary should run");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("only works with --bq or --gcloud"),
+        "usage error missing: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[cfg(unix)]
 fn fake_gcloud(args: &[&str]) -> String {
     let fake = std::env::temp_dir().join(format!(

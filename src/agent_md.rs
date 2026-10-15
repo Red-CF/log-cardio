@@ -44,8 +44,8 @@ to read everything you kept.
 | `--json` | NDJSON output: {"index","content"} |
 | `--since TS` / `--until TS` | keep lines with timestamp >= TS / < TS |
 | `--trace REGEX` | group lines by captured ID (e.g. request_id=...), sessions at end |
-| `--summary` | with --trace: compact per-ID map (count + first/last) |
-| `--stats` | survey mode: top-pattern frequencies, no stream output |
+| `--summary` | with --trace: compact per-ID map (count + first/last; `--top N` when IDs are many) |
+| `--stats` | survey mode: top-pattern frequencies, no stream output (digit runs fold to # — per-id noise groups) |
 | `--stats --json` | same survey as NDJSON on stdout: {"pattern","count"} |
 | `--gcloud FILTER` | stream Cloud Logging (--since/--until pushed server-side) |
 | `--bq "SQL"` | stream BigQuery rows via the bq CLI (CSV) |
@@ -53,6 +53,9 @@ to read everything you kept.
 | `--max-bytes-billed N` | bq only: errors out if the job would bill more than N bytes |
 | `--project ID` | bq only: project that runs the job (default = CLI's config) |
 | `--bq-args "…"` | bq only: raw bq CLI flags passthrough (whitespace-split) |
+| `--timeout SECS` | bq/gcloud only: kill a hung fetcher (its job id stays in stderr) |
+| `--top N` | summary mode: keep only the biggest N sessions |
+| `--max-field-len N` | cut huge fields/lines (XML bodies) with a "…" marker |
 | `--config FILE` | custom timestamp/boilerplate regexes, default_trace (TOML) |
 
 ## Output shape

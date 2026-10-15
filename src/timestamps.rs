@@ -365,3 +365,17 @@ pub(crate) fn server_ts(canonical: &str) -> &str {
     assert_canonical_shape(canonical);
     &canonical[..19]
 }
+#[cfg(test)]
+mod tests {
+    use super::next_day;
+
+    /// month/leap rollovers behind canonical_bound's date-only handling
+    #[test]
+    fn next_day_rollovers() {
+        assert_eq!(next_day("2024-02-28").as_deref(), Some("2024-02-29"));
+        assert_eq!(next_day("2024-02-29").as_deref(), Some("2024-03-01"));
+        assert_eq!(next_day("2025-02-28").as_deref(), Some("2025-03-01")); // not leap
+        assert_eq!(next_day("2026-04-30").as_deref(), Some("2026-05-01")); // 30-day
+        assert_eq!(next_day("9999-12-31").as_deref(), None); // clamp target
+    }
+}
