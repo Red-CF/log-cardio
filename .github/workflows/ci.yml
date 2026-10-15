@@ -8,7 +8,7 @@ on:
 jobs:
   # lint gate: zero warnings allowed (the codebase holds it today; this
   # keeps it from rotting)
-  clippy:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,7 +112,7 @@ jobs:
     # a merge to main ships the crate at the version the PR bumped to (the
     # required `version` check guarantees that version isn't on crates.io
     # yet; a same-version double merge would fail here — bump and re-merge)
-    needs: [test, build, coverage, clippy]
+    needs: [test, build, coverage, lint]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
