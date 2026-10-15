@@ -266,23 +266,8 @@ fn bq_lone_cr_content_is_preserved() {
 /// honest. Fakebin dir is unique per call and removed before returning.
 #[cfg(unix)]
 fn fake_bq(csv: &str, args: &[&str]) -> String {
-    use std::os::unix::fs::PermissionsExt;
-    let fake = std::env::temp_dir().join(format!(
-        "cardio_fakebin_{}",
-        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    let script = fake.join("bq");
-    std::fs::write(&script, format!("#!/bin/sh\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n"))
-        .expect("write fake bq");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake bq executable");
-    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(args)
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
-        .output()
-        .expect("cardio binary should run");
-    std::fs::remove_dir_all(&fake).ok();
+    let body = format!("#!/bin/sh\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n");
+    let out = run_with_fake("bq", &body, args);
     assert!(
         out.status.success(),
         "cardio exited {}: stderr: {:?}",
@@ -664,10 +649,6 @@ fn over_max_frac_line_collapses_to_max_shape() {
     );
 }
 
-/// Run cardio with a fake `gcloud` on PATH that echoes its FILTER arg
-/// (3rd positional, after `logging read`) to STDERR — cardio's stdout
-/// would trim the ts out of it via the normal pipeline. Asserts exit
-/// status; unique fakebin dir, removed before returning.
 /// Same as `cardio`, but both channels come back separately.
 fn cardio_out(args: &[&str]) -> (String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
@@ -687,31 +668,43 @@ fn cardio_out(args: &[&str]) -> (String, String) {
 }
 
 #[cfg(unix)]
-/// Fake bq whose argv is echoed to stderr (ARG:<flag> lines) and whose
-/// stdout is a fixed CSV — lets tests pin the exact bq invocation.
-fn fake_bq_argv(csv: &str, args: &[&str]) -> (String, String) {
+/// Spawn one fetcher stub: `script_body` becomes a shell script named
+/// `tool` in a fresh PATH-prepended temp dir; cardio runs against it and
+/// its full Output comes back (callers assert status/channels). The one
+/// fake-fetcher recipe — every `fake_*` helper is a thin wrapper so the
+/// scaffolding exists exactly once.
+fn run_with_fake(tool: &str, script_body: &str, args: &[&str]) -> std::process::Output {
     use std::os::unix::fs::PermissionsExt;
     let fake = std::env::temp_dir().join(format!(
-        "cardio_fakebqa_{}",
+        "cardio_fakebin_{}_{}",
+        tool,
         FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    let script = fake.join("bq");
-    std::fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\" >&2; done\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n"
-        ),
-    )
-    .expect("write fake bq");
+    let script = fake.join(tool);
+    std::fs::write(&script, script_body).expect("write fake script");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake bq executable");
+        .expect("make fake executable");
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .args(args)
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .env(
+            "PATH",
+            format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()),
+        )
         .output()
         .expect("cardio binary should run");
     std::fs::remove_dir_all(&fake).ok();
+    out
+}
+
+/// Fake bq whose argv is echoed to stderr (ARG:<flag> lines) and whose
+/// stdout is a fixed CSV — lets tests pin the exact bq invocation.
+#[cfg(unix)]
+fn fake_bq_argv(csv: &str, args: &[&str]) -> (String, String) {
+    let body = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\" >&2; done\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n"
+    );
+    let out = run_with_fake("bq", &body, args);
     assert!(
         out.status.success(),
         "cardio exited {}: stderr: {:?}",
@@ -825,46 +818,106 @@ fn stats_folds_digit_runs_into_one_pattern() {
 }
 
 #[cfg(unix)]
-fn fake_bq_status(script_body: &str, args: &[&str]) -> Option<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let fake = std::env::temp_dir().join(format!(
-        "cardio_fakebqs_{}",
-        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+fn fake_bq_script(script_body: &str, args: &[&str]) -> std::process::Output {
+    run_with_fake("bq", script_body, args)
+}
+
+#[cfg(unix)]
+#[test]
+fn gcloud_or_filter_is_parenthesized_on_pushdown() {
+    // AND binds tighter than OR: an unparenthesized "a OR b AND ts>=…"
+    // would bound only the last OR branch (whole-window stream on the rest)
+    let echo = fake_gcloud(&[
+        "--gcloud", "resource.type=gce OR resource.type=k8s",
+        "--since", "2026-10-15",
+    ]);
+    assert!(echo.contains("(resource.type=gce OR resource.type=k8s) AND timestamp>="), "filter wrapped: {echo:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fetcher_zero_rows_still_states_volume() {
+    // the empty-result-witnesses-failure fix: a header-only CSV streams 0
+    // lines and SAYS so
+    let (_, err) = fake_bq_argv("timestamp,text\n", &["--bq", "SELECT 1"]);
+    assert!(err.contains("Note: bq streamed 0 lines."), "zero-row witness: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn timeout_fires_even_when_child_closes_stdout_alive() {
+    // THE deadlock regression: child emits rows, closes stdout, keeps
+    // running — main reaches wait() with an alive child; the watchdog must
+    // still get the lock and kill it
+    let out = fake_bq_script(
+        "#!/bin/sh\necho \"timestamp,text\nrow\n\"\nexec 1>&-\nsleep 30\n",
+        &["--bq", "SELECT 1", "--raw", "--timeout", "1"],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("killed after --timeout 1s"),
+        "watchdog killed it: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn max_field_len_keeps_lines_distinct_for_dedup() {
+    // dedup sees the UNCLAMPED line: two long lines sharing their first
+    // 300 chars are distinct, and both survive the default lean pipeline
+    let path = fixture(&format!(
+        "{}-one\n{}-two\n",
+        "x".repeat(300).as_str(),
+        "x".repeat(300).as_str(),
     ));
-    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    std::fs::write(fake.join("bq"), script_body).expect("write fake bq");
-    std::fs::set_permissions(fake.join("bq"), std::fs::Permissions::from_mode(0o755))
-        .expect("make fake bq executable");
-    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(args)
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
-        .output()
-        .expect("cardio binary should run");
-    std::fs::remove_dir_all(&fake).ok();
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "expected failure got success: {err:?}");
-    assert!(err.contains("bq exited"), "fetcher failure must propagate: {err:?}");
-    Some(())
+    let out = cardio(&[
+        path.0.to_string_lossy().as_ref(),
+        "--max-field-len", "10",
+    ]);
+    assert_eq!(out.lines().count(), 2, "no post-clamp dedup collision: {out:?}");
+    assert!(out.contains("one>") || out.contains("…"), "clamped: {out:?}");
+}
+
+#[test]
+fn top_n_json_stream_stays_parseable() {
+    let path = fixture(
+        "2026-10-09T12:00:00Z req_id=a e1\n2026-10-09T12:00:01Z req_id=a e2\n         2026-10-09T12:00:02Z req_id=b e1\n2026-10-09T12:00:03Z req_id=b e2\n         2026-10-09T12:00:04Z req_id=b e3\n",
+    );
+    let (out, err) = cardio_out(&[
+        path.0.to_string_lossy().as_ref(),
+        "--trace", "req_id=([a-z])", "--json", "--top", "1",
+    ]);
+    for line in out.lines() {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("--top --json keeps stdout pure NDJSON: {e:?} in {line:?}"));
+    }
+    assert!(err.contains("1 smaller session dropped"), "json witness on stderr: {err:?}");
 }
 
 #[cfg(unix)]
 #[test]
 fn fetcher_failure_exits_nonzero() {
-    fake_bq_status(
+    let out = fake_bq_script(
         "#!/bin/sh\necho \"timestamp,text\nevent one\n\"\necho job_abc >&2\nexit 1\n",
         &["--bq", "SELECT 1", "--raw"],
     );
+    assert!(!out.status.success(), "failure must propagate, got success");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bq exited"), "failure reported: {err:?}");
 }
 
 #[cfg(unix)]
 #[test]
 fn timeout_kills_a_hung_fetcher() {
-    // child sleeps forever after printing a row: --timeout 1 must kill it
+    // child prints one row then sleeps forever: --timeout 1 must kill it
     // and fail the run honestly
-    fake_bq_status(
+    let out = fake_bq_script(
         "#!/bin/sh\necho \"timestamp,text\nevent one\n\"\nsleep 30\n",
         &["--bq", "SELECT 1", "--raw", "--timeout", "1"],
     );
+    assert!(!out.status.success(), "killed run must fail, got success");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("killed after --timeout 1s"), "timeout notice: {err:?}");
 }
 
 #[cfg(unix)]
@@ -883,24 +936,11 @@ fn timeout_errors_without_a_fetcher() {
 }
 
 #[cfg(unix)]
+/// Fake gcloud echoing its FILTER arg ($3 = logging read <filter>) to
+/// STDERR — cardio's stdout would trim the ts literal out of it via the
+/// normal pipeline, so tests pin the embed through stderr.
 fn fake_gcloud(args: &[&str]) -> String {
-    let fake = std::env::temp_dir().join(format!(
-        "cardio_fakegc_{}",
-        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
-    ));
-    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
-    let script = fake.join("gcloud");
-    std::fs::write(&script, "#!/bin/sh\necho \"$3\" >&2\n")
-        .expect("write fake gcloud");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-        .expect("make fake gcloud executable");
-    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(args)
-        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
-        .output()
-        .expect("cardio binary should run");
-    std::fs::remove_dir_all(&fake).ok();
+    let out = run_with_fake("gcloud", "#!/bin/sh\necho \"$3\" >&2\n", args);
     assert!(
         out.status.success(),
         "cardio exited {}: stderr: {:?}",

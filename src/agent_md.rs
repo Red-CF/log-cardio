@@ -54,7 +54,7 @@ to read everything you kept.
 | `--project ID` | bq only: project that runs the job (default = CLI's config) |
 | `--bq-args "…"` | bq only: raw bq CLI flags passthrough (whitespace-split) |
 | `--timeout SECS` | bq/gcloud only: kill a hung fetcher (its job id stays in stderr) |
-| `--top N` | summary mode: keep only the biggest N sessions |
+| `--top N` | trace mode (full or summary): keep only the biggest N sessions — the rest drop with a note |
 | `--max-field-len N` | cut huge fields/lines (XML bodies) with a "…" marker |
 | `--config FILE` | custom timestamp/boilerplate regexes, default_trace (TOML) |
 

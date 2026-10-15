@@ -112,8 +112,9 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) timeout: Option<u64>,
 
-    /// Keep only the biggest N sessions (event count); the rest drop with
-    /// a note. With hundreds of IDs even the summary map overflows context
+    /// Keep only the biggest N sessions (event count) in trace mode —
+    /// full or summary; the rest drop with a note. With hundreds of IDs
+    /// even the compact map overflows context.
     #[arg(long)]
     pub(crate) top: Option<usize>,
 
@@ -165,6 +166,9 @@ fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
     while let Some((_, line)) = proc.next_trimmed() {
         // get_mut fast path — no String alloc for a line already seen.
         // Cap gates only new insertions; existing counters keep advancing.
+        // Cap the key (--max-field-len) before folding: stats entries hold
+        // whole lines, and the cap is what keeps huge bodies bounded here.
+        let line = proc.clamp_fields(&line);
         let fold = line.bytes().any(|b| b.is_ascii_digit());
         let key: &str = if fold {
             key_buf.clear();
@@ -451,12 +455,12 @@ fn main() {
             eprintln!("Note: {} empty entr{} from {} were skipped.", empty_entries, if empty_entries == 1 { "y" } else { "ies" }, tool);
         }
     // Real-agent feedback: an empty result looked like a failure because
-    // nothing said otherwise. Every fetcher run states its volume so 0 rows
-    // has a witness — the job id is already in stderr from the child.
-    if let Some(tool) = child_tool
-        && stopped_at_line > 0 {
-            eprintln!("Note: {} streamed {} line{}.", tool, stopped_at_line, if stopped_at_line == 1 { "" } else { "s" });
-        }
+    // nothing said otherwise. EVERY fetcher run states its volume — zero
+    // included — so 0 rows has a witness; the job id is already in stderr
+    // from the child.
+    if let Some(tool) = child_tool {
+        eprintln!("Note: {} streamed {} line{}.", tool, stopped_at_line, if stopped_at_line == 1 { "" } else { "s" });
+    }
     if result.stats_capped {
         eprintln!("Warning: --stats reached its {} unique-pattern cap; later patterns untracked (existing counts are complete).", MAX_STATS_PATTERNS);
     }
@@ -495,7 +499,9 @@ fn main() {
 
     if let Some(sessions_map) = result.sessions {
         let dropped = emit_sessions(&sessions_map, args.top, args.json, &mut outbuf);
-        if dropped > 0 {
+        // text mode already carries the count inside its output header;
+        // the json stream must stay clean — this note is its witness only
+        if args.json && dropped > 0 {
             eprintln!(
                 "Note: {} smaller session{} dropped (--top {}).",
                 dropped, if dropped == 1 { "" } else { "s" }, args.top.unwrap_or(0)
@@ -511,19 +517,32 @@ fn main() {
     if early_cut
         && let Some(child) = &child { let _ = child.lock().unwrap().kill(); }
     if let Some(child) = &child {
-        match child.lock().unwrap().wait() {
-            Ok(status) if !status.success() => {
-                if early_cut {
-                    // already reported above; ignore the failure we caused
-                    // (EPIPE from killing the fetcher)
-                } else {
-                    // Propagate: scripts piping cardio must see fetch failures
-                    eprintln!("Error: {} exited with {}", child_tool.unwrap_or("fetcher"), status);
-                    exit(1);
+        // Poll try_wait with the mutex held per iteration only: holding it
+        // across a blocking wait() would deadlock the --timeout watchdog
+        // in exactly the hang cases it exists for (child alive, stdout
+        // closed, main parked in wait()).
+        let status;
+        loop {
+            match child.lock().unwrap().try_wait() {
+                Ok(Some(s)) => { status = Some(s); break; }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => {
+                    eprintln!("Warning: failed to wait for {}: {}", child_tool.unwrap_or("fetcher"), e);
+                    status = None;
+                    break;
                 }
             }
-            Ok(_) => {}
-            Err(e) => eprintln!("Warning: failed to wait for {}: {}", child_tool.unwrap_or("fetcher"), e),
+        }
+        let status = status.unwrap();
+        if !status.success() {
+            if early_cut {
+                // already reported above; ignore the failure we caused
+                // (EPIPE from killing the fetcher)
+            } else {
+                // Propagate: scripts piping cardio must see fetch failures
+                eprintln!("Error: {} exited with {}", child_tool.unwrap_or("fetcher"), status);
+                exit(1);
+            }
         }
     }
 

@@ -156,16 +156,17 @@ impl Pipeline {
                 }
             }
 
-            if self.verbatim {
-                return Some((self.line_no, self.clamp_fields(line)));
-            }
-
             // bq CLI progress chatter ("Waiting on bqjob_r… (…)") can reach
             // the output stream depending on CLI version/piping; it is not
-            // log content and never carries a timestamp. One cheap prefix
-            // check, child-scoped to bq only.
+            // log content and never carries a timestamp — so even --raw
+            // drops it (transport noise isn't fidelity). --quiet covers the
+            // modern CLI; this is the belt under that suspenders.
             if self.child_tool == Some("bq") && line.starts_with("Waiting on bqjob") {
                 continue;
+            }
+
+            if self.verbatim {
+                return Some((self.line_no, line.to_string()));
             }
 
             // one combined pass: ts + boilerplate as one alternation, both
@@ -182,14 +183,16 @@ impl Pipeline {
                 if self.child_tool.is_some() { self.empty_entries += 1; }
                 continue;
             }
-            return Some((self.line_no, self.clamp_fields(final_line)));
+            return Some((self.line_no, final_line.to_string()));
         }
     }
 
-    /// Field cap, applied only when the line is over budget (no alloc on
-    /// the common path). Tab-delimited segments cut individually;
-    /// tab-less lines count as one field. "…" marks the cut.
-    fn clamp_fields(&self, line: &str) -> String {
+    /// Field cap — call AFTER dedup/the stats key, never before: distinct
+    /// lines sharing their first N chars must not collide post-cut and be
+    /// mistaken for duplicates (real data loss, not the honest ~1% bloom).
+    /// Tab-delimited segments cut individually; tab-less lines count as
+    /// one field. "…" marks the cut.
+    pub(crate) fn clamp_fields(&self, line: &str) -> String {
         let Some(n) = self.max_field_len else {
             return line.to_string();
         };
@@ -237,7 +240,9 @@ pub(crate) fn run_stream(
     let mut window_full = false;
     while let Some((line_no, line)) = proc.next_trimmed() {
         if let Some(ref mut b) = bloom {
-            // single probe: check + insert in one hash pass
+            // single probe: check + insert in one hash pass — on the
+            // UNCLAMPED line, else lines sharing their first N chars
+            // collide as duplicates after --max-field-len
             if b.check_and_set(&line) {
                 dropped_dups += 1;
                 continue;
@@ -245,6 +250,7 @@ pub(crate) fn run_stream(
             // Track actual insertions: saturating past capacity = silent data loss
             dedup_inserts += 1;
         }
+        let line = proc.clamp_fields(&line);
         if let Some(n) = window_n {
             // line_no preserved so --tail --json keeps input indices
             if tail_buf.len() >= n {

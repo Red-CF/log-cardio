@@ -49,13 +49,16 @@ pub(crate) fn make_reader(
         if since_valid.is_none() {
             eprintln!("Warning: no --since — this gcloud call streams the WHOLE matching range, oldest first. Add --since unless you truly want everything.");
         }
-        let mut gc_filter = filter.clone();
+        // PARENTHESIZED: Cloud Logging binds AND tighter than OR — an
+        // unparenthesized "a OR b AND timestamp>=…" would bound only the
+        // last OR branch and stream the other branch's whole window.
         // bounds already canonicalized: no space separator remains. Pushdown
         // is second-precision (server_ts / until_server_bound): since >= its
         // floor second, until < its next second — the local exact filter
         // trims whatever the wider fetch returns. Comments claim nothing
         // about RFC 3339: these are plain gcloud timestamp literals (no
         // offset), the shape this pushdown has carried since it existed.
+        let mut gc_filter = format!("({})", filter);
         if let Some(s) = since_valid {
             gc_filter.push_str(&format!(" AND timestamp>=\"{}\"", server_ts(s)));
         }

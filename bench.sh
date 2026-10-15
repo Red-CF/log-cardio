@@ -59,16 +59,18 @@ else
         "raw (no pipeline)|$BIN $LOG --raw" \
         "stats survey|$BIN $LOG --stats" \
         "query filter|$BIN $LOG --query ERROR" \
-        "trace grouping|$BIN $LOG --trace sid=([a-z0-9]+)"; do
+        "trace grouping|$BIN $LOG --trace 'sid=([a-z0-9]+)'"; do
         label=${spec%%|*}; cmd=${spec#*|}
         # 3 warm + 3 timed runs, monotonic clock via python3 (date +%s is
         # 1s-resolution on macOS — useless at this scale)
         for _ in 1 2 3; do
-            eval "$cmd" >/dev/null 2>/dev/null
+            eval "$cmd" >/dev/null 2>/dev/null || true
         done
         t0=$(python3 -c 'import time; print(time.monotonic())')
         for _ in 1 2 3; do
-            eval "$cmd" >/dev/null 2>/dev/null
+            # || true: a mode erroring is a bench result too, not a script
+            # death (set -e would abort the whole table)
+            eval "$cmd" >/dev/null 2>/dev/null || true
         done
         t1=$(python3 -c 'import time; print(time.monotonic())')
         printf '%-28s %.3f s/3 runs\n' "$label" "$(python3 -c "print($t1 - $t0)")"

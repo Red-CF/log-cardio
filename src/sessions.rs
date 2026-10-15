@@ -56,6 +56,9 @@ pub(crate) fn collect_sessions(
     let mut sessions_capped = false;
     let mut lines_capped = false;
     while let Some((_, line)) = proc.next_trimmed() {
+        // clamp first so huge payloads don't bloat the map (dedup is not
+        // active in sessions mode, so no post-clamp collision risk here)
+        let line = proc.clamp_fields(&line);
         if let Some(max) = args.max_lines
             && count >= max {
                 proc.early_cut = true;
@@ -124,11 +127,15 @@ pub(crate) fn emit_sessions(
     view.sort_by_key(|(_id, s)| std::cmp::Reverse(size(s)));
     let dropped = top.map_or(0, |n| view.len().saturating_sub(n));
     if dropped > 0 {
+        // ONE channel per mode: text gets the header on stdout here, json
+        // gets nothing on stdout (main's stderr note is the json witness)
         let n = top.unwrap_or(0);
-        emit(outbuf, &format!(
-            "\n=== showing the top {} of {} sessions ({} smaller dropped; --top N adjusts) ===",
-            n, view.len(), dropped
-        ));
+        if !json {
+            emit(outbuf, &format!(
+                "\n=== showing the top {} of {} sessions ({} smaller dropped; --top N adjusts) ===",
+                n, view.len() + dropped, dropped
+            ));
+        }
         view.truncate(n);
     }
     if !json {

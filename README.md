@@ -91,7 +91,7 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 | `--dry-run` | bq-only: cost estimate only — runs `bq query --dry_run`, no rows read. |
 | `--bq-args "--flag=..."` | bq-only: raw bq CLI flags passthrough (whitespace-split, no quotes inside). |
 | `--timeout SECS` | bq/gcloud only: kill a hung fetcher after SECS (its job id stays in stderr). |
-| `--top N` | summary mode: keep only the biggest N sessions (event count). |
+| `--top N` | Trace mode (full or summary): keep only the biggest N sessions — the rest drop with a note. |
 | `--max-field-len N` | cut any field (or line) longer than N chars with a "…" marker. |
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
