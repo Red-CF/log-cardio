@@ -56,19 +56,19 @@ pub(crate) fn collect_sessions(
     let mut sessions_capped = false;
     let mut lines_capped = false;
     while let Some((_, line)) = proc.next_trimmed() {
-        // clamp first so huge payloads don't bloat the map (dedup is not
-        // active in sessions mode, so no post-clamp collision risk here)
-        let line = proc.clamp_fields(&line);
         if let Some(max) = args.max_lines
             && count >= max {
                 proc.early_cut = true;
                 break;
             }
+        // capture on the UNCLAMPED line, clamp only what we store: a trace
+        // id sitting further into a huge line must still group
         let Some(caps) = re.captures(&line) else { continue; };
         // group 0 is always present when captures() succeeds
         let id = caps.get(1)
             .unwrap_or_else(|| caps.get(0).unwrap())
             .as_str().to_string();
+        let line = proc.clamp_fields(&line);
         // len-before-entry: entry() holds the map borrow, can't re-len() here
         let at_cap = sessions.len() >= MAX_TRACE_SESSIONS;
         match sessions.entry(id) {

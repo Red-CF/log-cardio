@@ -42,6 +42,7 @@ with `--query` to read everything you kept.
 |---|---|
 | `--tail N` | only the LAST N kept lines. The #1 read, when you want what the log just said |
 | `--raw` | skip the agent pipeline: verbatim. No dedup, no cap, no trim (timestamps and levels survive) |
+| `--dedup` | with --raw: drop repeated lines after all (lean mode has dedup on by default) |
 | `--query error` | keep only lines containing TEXT (substring) |
 | `--max-lines N` | keep the LAST N lines, same tail semantics as --tail |
 | `--json` | NDJSON output: {"index","content"} |

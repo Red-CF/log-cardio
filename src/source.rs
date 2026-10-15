@@ -17,19 +17,36 @@ pub(crate) enum Source {
 }
 
 /// Spawn a child fetcher (gcloud/bq): piped stdout, inherited stderr.
+/// On unix the child gets its OWN process group: kill() would otherwise
+/// leave grandchildren (a `sleep` inside a wrapper script) holding the
+/// pipe write-end open, and main would block on the pipe until the
+/// orphan died of old age (a 30 s "hung" run was exactly this).
 /// Returns (raw stdout pipe, child we own for wait/kill).
 pub(crate) fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) {
-    let mut child = Command::new(tool)
-        .args(&argv)
+    let mut cmd = Command::new(tool);
+    cmd.args(&argv)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
-            exit(1);
-        });
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().unwrap_or_else(|e| {
+        eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
+        exit(1);
+    });
     let stdout: ChildStdout = child.stdout.take().expect("child stdout");
     (stdout, child)
+}
+
+/// Kill a fetcher AND its whole process group when possible (unix): a
+/// plain Child::kill leaves orphaned grandchildren holding the output
+/// pipe. The kill(1) subprocess is dependency-free; the plain kill falls
+/// back for the no-group case (windows / no kill binary).
+/// ponytail: libc::killpg if the spawn or edge cases ever bother anyone.
+pub(crate) fn kill_fetcher(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    let _ = Command::new("kill").arg("-9").arg(format!("-{pid}")).status();
+    let _ = child.kill();
 }
 
 /// Spawn gcloud / bq / open file / stdin. Returns the input source and any

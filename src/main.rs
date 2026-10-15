@@ -335,7 +335,7 @@ fn main() {
                 // hit an unrelated process)
                 Ok(Some(_)) | Err(_) => {}
                 Ok(None) => {
-                    let _ = c.kill();
+                    crate::source::kill_fetcher(&mut c);
                     eprintln!("Error: fetcher killed after --timeout {}s (its job id is visible in the output above).", secs);
                 }
             }
@@ -515,7 +515,10 @@ fn main() {
     // would die on EPIPE with a nonzero exit — reported as a failure we
     // caused.
     if early_cut
-        && let Some(child) = &child { let _ = child.lock().unwrap().kill(); }
+        && let Some(child) = &child {
+            let mut g = child.lock().unwrap();
+            source::kill_fetcher(&mut g);
+        }
     if let Some(child) = &child {
         // Poll try_wait with the mutex held per iteration only: holding it
         // across a blocking wait() would deadlock the --timeout watchdog
