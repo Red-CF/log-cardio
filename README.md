@@ -3,6 +3,9 @@
 [![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
 [![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/coverage.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
+[![macOS](https://img.shields.io/badge/macOS-supported-999999.svg)](https://github.com/Red-CF/log-cardio/releases)
+[![Linux](https://img.shields.io/badge/Linux-supported-fcc624.svg)](https://github.com/Red-CF/log-cardio/releases)
+[![Windows](https://img.shields.io/badge/Windows-supported-0078d6.svg)](https://github.com/Red-CF/log-cardio/releases)
 
 Fast Rust CLI that trims the fat from logs — fewer tokens for LLM agents.
 Logs can be GBs: cardio streams line by line with near-constant memory
@@ -32,6 +35,34 @@ Or from source:
 ```bash
 cargo install --path .
 ```
+
+## First run — getting oriented
+
+Cardio ships its own context: the first thing any agent (or person) should
+do is read the card, then survey the log — not read it raw.
+
+```bash
+cardio --agent-md > AGENTS.md   # the full contract: flags, output shapes, gotchas
+cardio app.log --stats          # survey: what does the log even contain?
+cardio app.log                  # then the lean read of what matters
+```
+
+Pipe `AGENTS.md` to your repo root once: agent runtimes pick it up
+automatically and never re-learn the tool by trial and error.
+
+## Tests
+
+```bash
+cargo test    # 61 total: 55 CLI integration (tests/cli.rs) + unit (src/timestamps.rs)
+```
+
+**Philosophy: black-box at the CLI level.** Tests pin the *promises* the
+agent card makes (trim behavior, dedup honesty, exit codes, stderr
+witnesses, JSON shapes) — so they survive refactors, and any doc-vs-code
+drift fails loudly. gcloud/bq are faked with PATH-stub shell scripts
+(`#[cfg(unix)]`) so the whole suite runs offline everywhere. Unit tests
+exist only for pure math a CLI test can't probe sanely (calendar
+rollovers, the 9999 clamp).
 
 ## Input
 
@@ -113,11 +144,23 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 
 ## Performance
 
-`./bench.sh` (or `N=1000000 ./bench.sh`) times every mode on a synthetic
-1M-line log — hyperfine when installed, a monotonic fallback otherwise.
-Current numbers (M1, release build): lean ≈ 0.5 s, raw ≈ 0.2 s,
-`--stats` ≈ 0.6 s per 1M lines (~105 MB/s lean) — the trim is one combined
-regex pass. For gcloud/bq sources the network dominates anyway.
+`./bench.sh` builds the release binary and times every mode on a synthetic
+1M-line log (50% duplicate lines, ids, huge XML bodies) — hyperfine when
+installed, a monotonic fallback otherwise. First run (M1, release):
+
+| mode | time per 1M lines |
+|---|---|
+| `cat` baseline | 0.02 s |
+| `--query` | 0.12 s |
+| `--raw` (no pipeline) | 0.20 s |
+| lean (default: trim + dedup + cap) | 0.51 s |
+| `--trace` (raw, uncapped) | 0.38 s |
+| `--stats` | 0.65 s |
+
+≈ 65 MB/s lean end to end; the trim runs as one combined regex pass. For
+gcloud/bq sources the network dominates anyway. (The bench's trace mode
+runs `--raw`: in lean mode the session cap bounds input early, so its
+time would measure the cap, not the grouper.)
 
 ## Time handling
 

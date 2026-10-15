@@ -59,7 +59,7 @@ else
         "raw (no pipeline)|$BIN $LOG --raw" \
         "stats survey|$BIN $LOG --stats" \
         "query filter|$BIN $LOG --query ERROR" \
-        "trace grouping|$BIN $LOG --trace 'sid=([a-z0-9]+)'"; do
+        "trace grouping (raw)|$BIN $LOG --raw --trace 'sid=([a-z0-9]+)'"; do
         label=${spec%%|*}; cmd=${spec#*|}
         # 3 warm + 3 timed runs, monotonic clock via python3 (date +%s is
         # 1s-resolution on macOS — useless at this scale)
