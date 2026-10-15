@@ -1,5 +1,12 @@
 # log-cardio 🏃🏼‍♂️
 
+[![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
+[![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/coverage.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
+[![macOS](https://img.shields.io/badge/macOS-ARM64-999999.svg)](https://github.com/Red-CF/log-cardio/releases)
+[![Linux](https://img.shields.io/badge/Linux-X64-fcc624.svg)](https://github.com/Red-CF/log-cardio/releases)
+[![Windows](https://img.shields.io/badge/Windows-X64-0078d6.svg)](https://github.com/Red-CF/log-cardio/releases)
+
 `cardio` is a fast Rust CLI that trims the fat from logs so LLM agents
 spend fewer tokens reading them. Logs can be GBs and cardio streams them
 line by line with near-constant memory (Bloom-filter dedup, capped
