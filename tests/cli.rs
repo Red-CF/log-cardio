@@ -492,6 +492,32 @@ fn minute_precision_line_enters_range_filter() {
 }
 
 #[test]
+fn agent_card_never_goes_stale() {
+    // the card is the contract: EVERY flag the binary accepts must appear
+    // in it. Adding a flag without documenting it fails here, not in
+    // production when an agent can't find it.
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .arg("--help")
+        .output()
+        .expect("cardio --help should run");
+    let help = String::from_utf8_lossy(&out.stdout);
+    let card = cardio(&["--agent-md"]);
+    // real flags are the ones clap lists as `  --name` at line start (the
+    // usage example inside an option's help also contains "--"-words and
+    // must not leak in); --help/--version are clap's own, never card items
+    for line in help.lines().map(str::trim_start).filter(|l| l.starts_with("--")) {
+        let name = line.split_whitespace().next().unwrap_or("");
+        if name == "--help" || name == "--version" {
+            continue;
+        }
+        assert!(
+            card.contains(name),
+            "--agent-md is missing the flag {name} (card must never be stale)"
+        );
+    }
+}
+
+#[test]
 fn agent_md_prints_card() {
     // the card must stay honest: exit 0, name the tool and the flags
     // the agent actually needs (lean mode, the dedup warning, ranges)

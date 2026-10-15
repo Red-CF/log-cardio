@@ -3,6 +3,9 @@
 /// changes.
 pub(crate) static AGENT_MD: &str = r#"# cardio: log trimming for agents
 
+You are reading the card printed by `cardio --agent-md`; re-print it
+whenever the binary updates so your context stays current.
+
 Trim noise from logs so they are cheap to read as tokens. Streams line by
 line with near-constant memory (Bloom-filter dedup, capped maps), so
 GB-sized inputs are fine: they never load into RAM. It can also fetch the
