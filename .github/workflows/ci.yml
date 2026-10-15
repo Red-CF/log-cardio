@@ -6,6 +6,17 @@ on:
   pull_request:
 
 jobs:
+  # lint gate: zero warnings allowed (the codebase holds it today; this
+  # keeps it from rotting)
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
+
   coverage:
     # coverage lives on its own named check: instrumented tests on Linux +
     # the gh-pages badge on main. Linux is covered here instead of `test` —
@@ -101,7 +112,7 @@ jobs:
     # a merge to main ships the crate at the version the PR bumped to (the
     # required `version` check guarantees that version isn't on crates.io
     # yet; a same-version double merge would fail here — bump and re-merge)
-    needs: [test, build, coverage]
+    needs: [test, build, coverage, clippy]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

@@ -70,6 +70,9 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 
 - `--max_rows=10000000` is passed because bq silently caps selects at
   1000 rows otherwise.
+- Column names print once on stderr (`Note: bq columns: a | b | …`);
+  rows join their fields with a tab, so empty/null columns keep their
+  separator and fields stay attributable.
 - `--since`/`--until` are NOT pushed into bq (the SQL is yours): filter
   dates in the query with a `WHERE` clause over `FORMAT_TIMESTAMP(...)`
   text, and the same ISO bounds still apply locally.
@@ -82,7 +85,11 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 |---|---|
 | `[file]` | Log file. Omitted → stdin. |
 | `--tail N` | Only the LAST N kept lines (after dedup/query; reads the whole input, ignores the cap). |
-| `--raw` | Skip the default agent pipeline: no dedup, no line cap. |
+| `--raw` | Skip the default agent pipeline: verbatim lines — no dedup, no cap, no timestamp/boilerplate trim. |
+| `--project ID` | bq-only: GCP project that runs the job (default = the CLI's configured project). |
+| `--max-bytes-billed N` | bq-only: hard bytes-billed cap — the query errors instead of scanning multi-TB tables. |
+| `--dry-run` | bq-only: cost estimate only — runs `bq query --dry_run`, no rows read. |
+| `--bq-args "--flag=..."` | bq-only: raw bq CLI flags passthrough (whitespace-split, no quotes inside). |
 | `--agent-md` | Print an agent-facing markdown card (pipe: `cardio --agent-md > AGENTS.md`). |
 | `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
 | `--dedup` | Drop repeated whole lines (Bloom filter — **~1% false positives, and they're unique lines thrown away**). |

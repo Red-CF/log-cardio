@@ -1,0 +1,146 @@
+//! Trace grouping: collect per-ID sessions and emit them. Full mode keeps
+//! every event line; summary keeps count + first/last. Caps gate NEW
+//! sessions / NEW lines only — existing sessions keep collecting past
+//! their caps.
+
+use crate::pipeline::{Pipeline, emit, Sink};
+use crate::Args;
+use regex::Regex;
+use std::collections::{btree_map, BTreeMap, HashMap};
+
+pub(crate) const MAX_TRACE_SESSIONS: usize = 10_000;
+pub(crate) const MAX_LINES_PER_SESSION: usize = 1_000;
+
+/// What a run does with the pipeline output.
+pub(crate) enum Run {
+    /// survey: pattern frequencies to stderr, no stream output
+    Stats,
+    /// group by ID: full sessions or the compact --summary map
+    Sessions,
+    /// plain one-line-per-event stream
+    Stream,
+}
+
+pub(crate) struct RunResult {
+    pub(crate) stats_map: Option<HashMap<String, usize>>,
+    pub(crate) sessions: Option<BTreeMap<String, Session>>,
+    pub(crate) stats_capped: bool,
+    pub(crate) sessions_capped: bool,
+    pub(crate) session_lines_capped: bool,
+    pub(crate) dedup_inserts: usize,
+    pub(crate) dropped_dups: usize,
+    // Stream mode: the --tail/lean window overflowed (input had more kept
+    // lines than the window) — feeds the "kept the last N" stderr note
+    pub(crate) window_full: bool,
+}
+
+/// Trace/summary share collection and emission; the variant only changes what
+/// a session keeps. BTreeMap = stable, reproducible order across runs.
+pub(crate) enum Session {
+    /// full trace: every event line of the session
+    Full(Vec<String>),
+    /// summary: event count, first event, last event — IDs always preserved
+    Summary(usize, String, String),
+}
+
+/// Sessions mode: collect Full or Summary per ID. Caps gate NEW sessions /
+/// NEW lines only — existing sessions keep collecting past their caps.
+pub(crate) fn collect_sessions(
+    proc: &mut Pipeline,
+    args: &Args,
+    re: &Regex,
+) -> (BTreeMap<String, Session>, bool, bool) {
+    let summary = args.summary;
+    let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
+    let mut count = 0usize;
+    let mut sessions_capped = false;
+    let mut lines_capped = false;
+    while let Some((_, line)) = proc.next_trimmed() {
+        if let Some(max) = args.max_lines
+            && count >= max {
+                proc.early_cut = true;
+                break;
+            }
+        let Some(caps) = re.captures(&line) else { continue; };
+        // group 0 is always present when captures() succeeds
+        let id = caps.get(1)
+            .unwrap_or_else(|| caps.get(0).unwrap())
+            .as_str().to_string();
+        // len-before-entry: entry() holds the map borrow, can't re-len() here
+        let at_cap = sessions.len() >= MAX_TRACE_SESSIONS;
+        match sessions.entry(id) {
+            btree_map::Entry::Occupied(mut e) => match e.get_mut() {
+                Session::Full(v) => {
+                    if v.len() < MAX_LINES_PER_SESSION {
+                        v.push(line);
+                        count += 1;
+                    } else {
+                        lines_capped = true;
+                    }
+                }
+                Session::Summary(n, _, last) => {
+                    // auto-ref-mut binding; reuse the buffer, no per-event alloc
+                    *n += 1;
+                    last.clear();
+                    last.push_str(&line);
+                    count += 1;
+                }
+            },
+            btree_map::Entry::Vacant(e) => {
+                if at_cap {
+                    sessions_capped = true;
+                } else {
+                    let l = line.to_string();
+                    e.insert(if summary {
+                        Session::Summary(1, l.clone(), l)
+                    } else {
+                        Session::Full(vec![l])
+                    });
+                    count += 1;
+                }
+            }
+        }
+    }
+    (sessions, sessions_capped, lines_capped)
+}
+
+/// Emit collected sessions — one JSON object or one text block per ID.
+pub(crate) fn emit_sessions(sessions: &BTreeMap<String, Session>, json: bool, outbuf: &mut Sink) {
+    if json {
+        for (id, s) in sessions {
+            let value = match s {
+                Session::Full(lines) => serde_json::json!({"id": id, "events": lines}),
+                Session::Summary(count, first, last) => serde_json::json!({
+                    "id": id, "count": count, "first": first, "last": last
+                }),
+            };
+            let out = serde_json::to_string(&value).unwrap();
+            emit(outbuf, &out);
+        }
+    } else {
+        let summary = sessions.values().next()
+            .is_some_and(|s| matches!(s, Session::Summary(..)));
+        if summary {
+            emit(outbuf, &format!("\n=== TRACE SUMMARY: {} sessions ===", sessions.len()));
+        }
+        for (id, s) in sessions {
+            match s {
+                Session::Full(lines) => {
+                    emit(outbuf, &format!("\n--- [{}] ---\n{}", id, lines.join("\n")));
+                }
+                Session::Summary(count, first, last) => {
+                    // 1-event session: first == last — print once, singular label
+                    let body = if *count == 1 {
+                        first.to_string()
+                    } else {
+                        format!("{}\n{}", first, last)
+                    };
+                    emit(outbuf, &format!(
+                        "--- [{}] {} event{} ---\n{}", id, count,
+                        if *count == 1 { "" } else { "s" }, body
+                    ));
+                }
+            }
+        }
+    }
+}
