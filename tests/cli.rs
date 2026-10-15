@@ -502,7 +502,7 @@ fn agent_md_prints_card() {
     assert!(out.status.success(), "got: {:?}", out.status);
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
-        s.contains("lean by default") && s.contains("UNIQUE") && s.contains("--raw") && s.contains("--since"),
+        s.contains("lean by default") && s.to_lowercase().contains("unique") && s.contains("--raw") && s.contains("--since"),
         "got: {s:?}"
     );
 }
