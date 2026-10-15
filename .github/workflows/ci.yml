@@ -104,13 +104,31 @@ jobs:
           path: cardio-*
 
   version:
-    # the merge gate: a PR must bump Cargo.toml above what crates.io has,
-    # or the merge button stays locked
+    # the merge gate: a PR that changes SHIPPABLE code must bump Cargo.toml
+    # above what crates.io has, or the merge button stays locked. Infra PRs
+    # (workflow, docs, tests, bench) are excluded: a CI fix must not force
+    # a version, and a version-only bump would ship a release without
+    # meaning anything.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: version must be new to crates.io
+      - name: does this PR touch shippable code?
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # the PR's actual file list (shallow clone: no merge base locally)
+          FILES=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename')
+          echo "$FILES"
+          if echo "$FILES" | grep -qE '^(src/|Cargo\.(toml|lock)$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR touches no shippable code; version gate skipped."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.scope.outputs.code == 'true'
+        name: version must be new to crates.io
         run: |
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           PUBLISHED=""
@@ -127,9 +145,10 @@ jobs:
           fi
 
   release:
-    # a merge to main ships the crate at the version the PR bumped to (the
-    # required `version` check guarantees that version isn't on crates.io
-    # yet; a same-version double merge would fail here — bump and re-merge)
+    # a merge to main ships the crate ONLY when the version is new to
+    # crates.io: merges without a version bump (infra PRs, accumulated
+    # WIP before a deliberate release) leave the crate untouched and the
+    # job exits green without publishing anything
     needs: [test, build, coverage, lint, audit]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -137,12 +156,31 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - id: decide
+        name: release only if this version is new to crates.io
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          KNOWN=""
+          # retry: a single bad response from the registry mustn't kill the run
+          for i in 1 2 3; do
+            KNOWN=$(curl -sfL -A "log-cardio-ci" "https://crates.io/api/v1/crates/log-cardio/versions" | jq -r --arg v "$V" '[.versions[].num | select(. == $v)] | length' 2>/dev/null) || true
+            [ -n "$KNOWN" ] && break
+            sleep 3
+          done
+          [ -n "$KNOWN" ] || KNOWN="1"  # registry blind -> don't ship blind
+          if [ "$KNOWN" != "0" ]; then
+            echo "Already-released version $V: no publish (no-release merge)."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
       - name: cargo publish
+        if: steps.decide.outputs.release == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
       - name: tag + GitHub release
+        if: steps.decide.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -153,10 +191,12 @@ jobs:
           git push origin "v$V"
           gh release create "v$V" --generate-notes
       - uses: actions/download-artifact@v8
+        if: steps.decide.outputs.release == 'true'
         with:
           path: bins
           merge-multiple: true
       - name: attach native binaries
+        if: steps.decide.outputs.release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
