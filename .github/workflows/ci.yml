@@ -98,7 +98,7 @@ jobs:
         run: |
           EXT=$([ "$RUNNER_OS" = "Windows" ] && echo .exe || echo "")
           mv "target/release/cardio$EXT" "cardio-$RUNNER_OS-$RUNNER_ARCH$EXT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cardio-${{ runner.os }}
           path: cardio-*
