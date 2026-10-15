@@ -68,6 +68,11 @@ bq tips:
 cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestamp FROM prod.traces'
 ```
 
+- **The biggest lever is the SQL, not cardio**: SELECT exactly the fields
+  you need (`jsonPayload.message`) — never `TO_JSON_STRING(payload)`
+  wholesale. A wide SELECT costs more than any trim saves. cardio's edge
+  is repetitive or broad downloads; a narrow trace-sized query is already
+  optimal without it.
 - `--max_rows=10000000` is passed because bq silently caps selects at
   1000 rows otherwise.
 - Column names print once on stderr (`Note: bq columns: a | b | …`);

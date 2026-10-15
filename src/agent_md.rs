@@ -73,6 +73,12 @@ the line itself (the line does not have to start with one); compares are
 tz-naive — don't mix `+02:00` logs against UTC bounds.
 
 ## Gotchas
+- SQL discipline beats the trimmer: SELECT exactly the fields you need
+  (e.g. `jsonPayload.message`) instead of whole payloads
+  (`TO_JSON_STRING(jsonPayload)`) — a wide SELECT costs more than any
+  trim saves, and cardio can't fix column choice. cardio's edge is
+  repetitive or broad raw downloads; when your query is already narrow
+  and trace-sized, filtering in SQL is cheaper and cardio adds little.
 - A line whose timestamp doesn't match the (configurable) timestamp
   grammar — e.g. a bare date with no time — bypasses the range filter
   and is printed as-is; there is no warning for it today.
