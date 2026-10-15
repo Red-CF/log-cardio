@@ -668,7 +668,6 @@ fn over_max_frac_line_collapses_to_max_shape() {
 /// (3rd positional, after `logging read`) to STDERR — cardio's stdout
 /// would trim the ts out of it via the normal pipeline. Asserts exit
 /// status; unique fakebin dir, removed before returning.
-#[cfg(unix)]
 /// Same as `cardio`, but both channels come back separately.
 fn cardio_out(args: &[&str]) -> (String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
@@ -687,6 +686,7 @@ fn cardio_out(args: &[&str]) -> (String, String) {
     )
 }
 
+#[cfg(unix)]
 /// Fake bq whose argv is echoed to stderr (ARG:<flag> lines) and whose
 /// stdout is a fixed CSV — lets tests pin the exact bq invocation.
 fn fake_bq_argv(csv: &str, args: &[&str]) -> (String, String) {
@@ -736,6 +736,7 @@ fn raw_is_verbatim_timestamps_and_levels_survive() {
     assert!(!lean.contains("2026-10-09T12:00:00Z"), "lean strips the timestamp: {lean:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn bq_argv_carries_cost_and_project_flags() {
     let (_, err) = fake_bq_argv(
@@ -770,6 +771,7 @@ fn bq_flags_error_without_bq() {
     assert!(err.contains("only works with --bq"), "usage error missing: {err:?}");
 }
 
+#[cfg(unix)]
 fn fake_gcloud(args: &[&str]) -> String {
     let fake = std::env::temp_dir().join(format!(
         "cardio_fakegc_{}",
