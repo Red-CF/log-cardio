@@ -44,6 +44,29 @@ Or build from source:
 cargo install --path .
 ```
 
+## Updating and uninstalling
+
+- **Installed with cargo**: update by re-running `cargo install log-cardio`;
+  remove with `cargo uninstall cardio`.
+- **Installed with the script**: update by re-running the install script
+  (it overwrites the binary with the latest release):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Red-CF/log-cardio/main/install.sh | sh
+```
+
+Remove it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Red-CF/log-cardio/main/uninstall.sh | sh
+```
+
+cardio installs exactly one file, a static binary (at `/usr/local/bin/cardio`
+or `~/.local/bin/cardio`). There is no config, cache, or daemon anywhere:
+deleting that file is a complete removal.
+
+- **Windows**: delete the `.exe` you put on your `PATH`.
+
 ## First run: getting oriented
 
 Cardio explains itself. Before reading any log, an agent (or person)
