@@ -36,4 +36,6 @@ else
 fi
 mv "$BIN" "$PREFIX/cardio"
 echo "installed: $PREFIX/cardio"
+echo "update:    re-run this script (it overwrites with the latest release)"
+echo "uninstall: curl -fsSL https://raw.githubusercontent.com/$REPO/main/uninstall.sh | sh"
 cardio --version 2>/dev/null || echo "(run it from the path above)"

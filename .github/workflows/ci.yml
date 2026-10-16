@@ -119,7 +119,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # the PR's actual file list (shallow clone: no merge base locally)
-          FILES=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename')
+          FILES=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename') \
+            || { echo "::error::could not list PR files — skipping the gate this way would be fail-open; retry the check"; exit 1; }
           echo "$FILES"
           if echo "$FILES" | grep -qE '^(src/|Cargo\.(toml|lock)$)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
@@ -167,7 +168,11 @@ jobs:
             [ -n "$KNOWN" ] && break
             sleep 3
           done
-          [ -n "$KNOWN" ] || KNOWN="1"  # registry blind -> don't ship blind
+          # fail loud, not silent: a flaky registry must skip NOTHING (a
+          # release that "went green" without publishing would be missed);
+          # the decide step is free to re-run manually, cargo publish alone
+          # guards against a true double publish
+          [ -n "$KNOWN" ] || { echo "::error::registry query failed after 3 tries — re-run the release job"; exit 1; }
           if [ "$KNOWN" != "0" ]; then
             echo "Already-released version $V: no publish (no-release merge)."
             echo "release=false" >> "$GITHUB_OUTPUT"
