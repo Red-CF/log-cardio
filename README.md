@@ -3,6 +3,7 @@
 [![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
 [![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/coverage.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
+[![bench](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/bench.svg)](https://htmlpreview.github.io/?https://github.com/Red-CF/log-cardio/blob/gh-pages/bench.html)
 [![macOS ARM64](https://img.shields.io/badge/macOS-ARM64-999999.svg)](https://github.com/Red-CF/log-cardio/releases)
 [![macOS Intel](https://img.shields.io/badge/macOS-Intel-999999.svg)](https://github.com/Red-CF/log-cardio/releases)
 [![Linux](https://img.shields.io/badge/Linux-X64-fcc624.svg)](https://github.com/Red-CF/log-cardio/releases)
@@ -260,6 +261,12 @@ monotonic-clock loop. First run (M1, release build):
 | `--trace` (raw, uncapped) | 0.39 s |
 | `--stats` | 0.68 s |
 | lean (trim + exact dedup + window + field cut) | 0.62 s |
+
+The badge at the top shows the LIVE lean number, measured by CI on
+github's ubuntu runners after every release (and on demand via
+workflow_dispatch) — full per-mode tables at the badge's link. Numbers
+on other hardware: `./bench.sh` and read your own table. The snapshot
+below was one local M1 run for orientation.
 
 That is roughly 75 MB/s on the lean path end to end (the 1000-char
 field cutoff included, byte-length fast path). The trim runs as a
