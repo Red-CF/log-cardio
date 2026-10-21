@@ -47,7 +47,7 @@ if command -v hyperfine >/dev/null; then
     # -N = default shell (no user sh rc); style basic = the standard table
     # BENCH_JSON=path: machine-readable results (the CI bench badge reads it)
     EXPORT=""
-    [ -n "$BENCH_JSON" ] && EXPORT="--export-json $BENCH_JSON"
+    [ -n "${BENCH_JSON:-}" ] && EXPORT="--export-json $BENCH_JSON"
     hyperfine --warmup 1 --min-runs 3 $EXPORT --style basic -N \
         "/bin/cat $LOG" \
         "$BIN $LOG" \
