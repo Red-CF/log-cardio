@@ -43,8 +43,8 @@ pub(crate) enum Session {
     Summary(usize, String, String),
 }
 
-/// Sessions mode: collect Full or Summary per ID. Caps gate NEW sessions /
-/// NEW lines only — existing sessions keep collecting past their caps.
+/// Sessions mode: collect Full or Summary per ID; the event cap is
+/// --head (earliest events win). Caps gate NEW sessions / NEW lines only
 pub(crate) fn collect_sessions(
     proc: &mut Pipeline,
     args: &Args,
@@ -56,7 +56,7 @@ pub(crate) fn collect_sessions(
     let mut sessions_capped = false;
     let mut lines_capped = false;
     while let Some((_, line)) = proc.next_trimmed() {
-        if let Some(max) = args.max_lines
+        if let Some(max) = args.head
             && count >= max {
                 proc.early_cut = true;
                 break;

@@ -135,6 +135,27 @@ pub(crate) fn make_reader(
             eprintln!("Note: bq columns: {}", h.iter().collect::<Vec<_>>().join(" | "));
         }
         (Source::Rows(rows), Some(("bq", child)))
+    } else if let Some(selector) = &args.k8s {
+        // kubectl logs selector (pod/name, deployment/name, bare name);
+        // the namespace and context are kubectl's own (current ones).
+        // The agent's most expensive mistake is still an unbounded stream.
+        if since_valid.is_none() {
+            eprintln!("Warning: no --since — this kubectl logs call streams from pod creation. Add --since unless you want everything.");
+        }
+        let mut k8s_args: Vec<String> = vec!["logs".into(), selector.clone()];
+        if let Some(c) = &args.k8s_container {
+            k8s_args.push("-c".into());
+            k8s_args.push(c.clone());
+        }
+        // since pushdown: kubectl wants RFC3339 — canonical without frac,
+        // UTC 'Z' appended (the tz-naive caveat is the same as gcloud's).
+        // ponytail: pushdown is the ONLY reason --k8s exists — the trim
+        // engine works through a plain kubectl pipe without it.
+        if let Some(s) = since_valid {
+            k8s_args.push(format!("--since-time={}Z", server_ts(s)));
+        }
+        let (stdout, child) = spawn_fetcher("kubectl", k8s_args);
+        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("kubectl", child)))
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {
             eprintln!("Error opening file {}: {}", path, e);

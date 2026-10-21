@@ -555,7 +555,7 @@ fn default_pipeline_dedups_and_caps_raw_skips_it() {
     assert_eq!(count, 0, "head of the range must leave the window, got {count}");
     assert!(out.contains("unique-2099") && !out.contains("unique-0099"), "cap 2000 must keep the most recent");
     // explicit --max-lines overrides the default cap (same tail semantics)
-    let capped = cardio(&["--max-lines", "5", &p]);
+    let capped = cardio(&["--tail", "5", &p]);
     assert_eq!(capped.lines().count(), 5, "got {}", capped.lines().count());
     assert!(capped.contains("unique-2099"), "explicit cap keeps the latest: {capped:?}");
     // --raw: no dedup, no cap — both repeats and every unique survive
@@ -601,7 +601,7 @@ fn lean_signals_what_it_dropped() {
         .expect("cardio binary should run");
     assert!(out.status.success(), "got: {:?}", out.status);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("dedup dropped 1 duplicate-suspect line"), "got: {err:?}");
+    assert!(err.contains("dedup dropped 1 repeat line"), "got: {err:?}");
     assert!(!err.contains("kept the last"), "no cap in a short run: {err:?}");
 
     let big: String = (0..2001).map(|i| format!("2026-10-09T12:{:02}:{:02} u{i:04}\n", i / 60, i % 60)).collect();
@@ -955,7 +955,7 @@ fn timeout_errors_without_a_fetcher() {
         .expect("cardio binary should run");
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only works with --bq or --gcloud"),
+        String::from_utf8_lossy(&out.stderr).contains("only works with --bq, --gcloud, or --k8s"),
         "usage error missing: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );

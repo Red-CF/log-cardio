@@ -10,7 +10,6 @@ mod sessions;
 mod source;
 mod timestamps;
 
-use bloomfilter::Bloom;
 use clap::Parser;
 use regex::Regex;
 use sessions::{Run, RunResult, emit_sessions};
@@ -26,7 +25,12 @@ use timestamps::{TRIM_BODY, canonical_bound, is_full_iso};
 const MAX_STATS_PATTERNS: usize = 100_000;
 /// --lean output cap: enough events for a debugging session, small
 /// enough that an agent never swallows a token wall by accident.
-const LEAN_MAX_LINES: usize = 2_000;
+/// lean window size; the SIDE depends on the source (fetcher = head,
+/// stream = tail) — run_stream implements the pairing
+pub(crate) const LEAN_MAX_LINES: usize = 2_000;
+/// lean default field cut: JWTs/payloads that never carry an id in their
+/// tail get marked with an ellipsis instead of eating context; 0 disables
+const FIELD_LEN_DEFAULT: usize = 1000;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Trim noise from logs for LLM agents")]
@@ -42,20 +46,25 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) dedup: bool,
 
-    /// Keep only the LAST N lines — the most recent beat the old (whole
-    /// input reads; event count in trace mode; ignored with --stats)
+    /// Keep only the LAST N kept lines — the most recent beat the old
+    /// (whole input reads). The lean default for files/stdin
     #[arg(long)]
-    pub(crate) max_lines: Option<usize>,
+    pub(crate) tail: Option<usize>,
+
+    /// Keep only the FIRST N kept lines — the lean default for cloud
+    /// fetchers (the query's own ordering is user intent); in
+    /// --trace/--summary mode this is the event cap per run
+    #[arg(long)]
+    pub(crate) head: Option<usize>,
+
+    /// Drop the first N kept lines before the window — bq paging:
+    /// `--skip 100 --head 100` is page 2
+    #[arg(long)]
+    pub(crate) skip: Option<usize>,
 
     /// Output in JSON format
     #[arg(long)]
     pub(crate) json: bool,
-
-    /// Only the last N kept lines (after dedup/query). Reads the WHOLE
-    /// input — the line cap does not apply; the tail replaces it. The
-    /// #1 agent read: "what did the log just say".
-    #[arg(long)]
-    pub(crate) tail: Option<usize>,
 
     /// Only lines with timestamp >= this (ISO, or YYYY-MM-DD = day start).
     #[arg(long)]
@@ -81,6 +90,16 @@ pub(crate) struct Args {
     /// GCloud Logging filter (e.g. "resource.type=gce_instance")
     #[arg(long)]
     pub(crate) gcloud: Option<String>,
+
+    /// kubectl logs target: "pod/my-api-abc123", "deployment/my-api" or a
+    /// bare name; uses the current kubectl context and namespace. --since
+    /// pushes to kubectl's --since-time (UTC); --until filters locally
+    #[arg(long)]
+    pub(crate) k8s: Option<String>,
+
+    /// Container name for kubectl logs (-c); with --k8s
+    #[arg(short = 'c', long = "container")]
+    pub(crate) k8s_container: Option<String>,
 
     /// BigQuery SQL — runs the bq CLI (CSV output) and feeds rows into the
     /// same pipeline (query/range/trace/summary/stats)
@@ -212,28 +231,37 @@ fn main() {
         exit(0);
     }
 
-    // Lean is the default pipeline: unless --raw, dedup on and the cap
-    // defaults to LEAN_MAX_LINES (an explicit --max-lines wins --raw
-    // notwithstanding: asking for a cap is asking for a cap). Mutating
-    // args keeps the runners untouched; a local dedup so the trace-mode
-    // warning only fires when --dedup was explicitly passed.
+    // Lean is the default pipeline: unless --raw, dedup on, and the
+    // window defaults to LEAN_MAX_LINES with a side chosen per source
+    // (fetchers keep their head — a fetcher's query ordering is the
+    // caller's intent; streams keep the tail — recent beats old). An
+    // explicit --head/--tail wins --raw notwithstanding: asking for a
+    // cap is asking for a cap.
     let mut args = args;
     let dedup = args.dedup || !args.raw;
     if !args.raw {
-        args.max_lines = args.max_lines.or(Some(LEAN_MAX_LINES));
+        args.max_field_len = args.max_field_len.or(Some(FIELD_LEN_DEFAULT));
+    }
+    if args.max_field_len == Some(0) {
+        args.max_field_len = None; // explicit "unlimited fields"
+    }
+    if args.head.is_some() && args.tail.is_some() {
+        eprintln!("Error: --head and --tail are both windows; pass at most one.");
+        exit(2);
     }
 
-    // exactly one source: file / gcloud / bq
+    // exactly one source: file / gcloud / bq / k8s
     let sources = [
         args.gcloud.is_some(),
         args.bq.is_some(),
+        args.k8s.is_some(),
         args.file_path.is_some(),
     ]
     .iter()
     .filter(|b| **b)
     .count();
     if sources > 1 {
-        eprintln!("Error: pass only one source: a file path, --gcloud, or --bq.");
+        eprintln!("Error: pass only one source: a file path, --gcloud, --bq, or --k8s.");
         exit(1);
     }
 
@@ -263,8 +291,13 @@ fn main() {
             eprintln!("Error: {flag} only works with --bq.");
             exit(2);
         }
-    if args.timeout.is_some() && args.bq.is_none() && args.gcloud.is_none() {
-        eprintln!("Error: --timeout only works with --bq or --gcloud.");
+    if args.timeout.is_some()
+        && args.bq.is_none() && args.gcloud.is_none() && args.k8s.is_none() {
+        eprintln!("Error: --timeout only works with --bq, --gcloud, or --k8s.");
+        exit(2);
+    }
+    if args.k8s_container.is_some() && args.k8s.is_none() {
+        eprintln!("Error: -c/--container only works with --k8s.");
         exit(2);
     }
 
@@ -319,8 +352,9 @@ fn main() {
     if args.dedup && trace_re.is_some() {
         eprintln!("Warning: --dedup is ignored in trace mode (sessions keep every event).");
     }
-    if args.tail.is_some() && !matches!(run, Run::Stream) {
-        eprintln!("Note: --tail applies to the line stream; --stats/--trace/--summary ignore it.");
+    if (args.tail.is_some() || args.head.is_some() || args.skip.is_some())
+        && !matches!(run, Run::Stream) {
+        eprintln!("Note: --head/--tail/--skip apply to the line stream; --stats ignores them (--head caps events in trace mode).");
     }
 
     // Bounds are fixed for the whole run: validate (fail-fast above) +
@@ -375,13 +409,6 @@ fn main() {
         raw_buf: Vec::new(),
     };
 
-    // --stats/--trace never stream per line, so bloom only exists in stream mode
-    let mut bloom = if matches!(run, Run::Stream) && dedup {
-        Some(Bloom::new_for_fp_rate(10_000_000, 0.01).expect("Failed to init bloom filter"))
-    } else {
-        None
-    };
-
     let mut out = io::stdout().lock();
     let mut outbuf: Sink = io::BufWriter::new(&mut out);
 
@@ -414,7 +441,7 @@ fn main() {
             }
         }
         Run::Stream => {
-            let (dedup_inserts, dropped_dups, window_full) = run_stream(&mut proc, bloom.as_mut(), &args, &mut outbuf);
+            let (dedup_inserts, dropped_dups, window_full) = run_stream(&mut proc, dedup, &args, &mut outbuf);
             RunResult {
                 stats_map: None,
                 sessions: None,
@@ -446,7 +473,7 @@ fn main() {
     // given up — never silently.
     if result.dropped_dups > 0 {
         eprintln!(
-            "Note: dedup dropped {} duplicate-suspect line{} (a few may actually be unique — --raw keeps everything).",
+            "Note: dedup dropped {} repeat line{}. Under the 5000-unique-lines mark dedup is exact; above it, a few may actually be unique (--raw keeps everything).",
             result.dropped_dups,
             if result.dropped_dups == 1 { "" } else { "s" }
         );
@@ -454,11 +481,14 @@ fn main() {
     if result.window_full && args.tail.is_none() {
         eprintln!(
             "Note: kept the last {} lines — the most recent; the rest of the input was read and trimmed (--raw removes the cap; --query TEXT narrows before reading).",
-            args.max_lines.unwrap_or(0)
+            LEAN_MAX_LINES
         );
     }
     if early_cut {
-        eprintln!("Note: output stopped at the --max-lines cap; the rest of the input was not read (--raw removes the cap).");
+        eprintln!(
+            "Note: output stopped at the head cap ({} lines) — the head is kept, the rest was not read (--raw removes the cap; --query narrows).",
+            args.head.unwrap_or(LEAN_MAX_LINES)
+        );
     }
     if result.dedup_inserts > 10_000_000 {
         eprintln!("Warning: --dedup exceeded 10M unique lines; bloom filter is saturated and unique lines may be dropped as false duplicates.");
