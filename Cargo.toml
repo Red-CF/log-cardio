@@ -3,7 +3,7 @@
 name = "log-cardio"
 version = "1.0.0"
 edition = "2024"
-description = "Trim the fat from logs for LLM agents: lean default pipeline (trim + dedup + cap), direct gcloud/bq streaming, trace grouping and surveys — GBs in, tokens out."
+description = "Trim the fat from logs for LLM agents: lean pipeline (trim + dedup + window), direct gcloud/bq/kubectl streaming with cost guards, trace grouping, token-aware surveys, and an MCP stdio server (--mcp)."
 license = "MIT"
 repository = "https://github.com/Red-CF/log-cardio"
 
