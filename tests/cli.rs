@@ -1043,9 +1043,14 @@ fn run_with_fake(tool: &str, bat_body: &str, args: &[&str]) -> std::process::Out
     std::fs::create_dir_all(&fake).expect("mkdir fakebin");
     let script = fake.join(format!("{tool}.cmd"));
     std::fs::write(&script, bat_body).expect("write fake script");
+    // PATH = ONLY the fake dir (+ System32 for batch builtins like ping):
+    // a real kubectl.exe/bq.exe elsewhere in the inherited PATH would WIN
+    // the spawn search before our kubectl.cmd shim ever mattered, and the
+    // test would drive a live binary against a nonexistent cluster
+    // (exactly what the first Windows run caught).
     let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
         .args(args)
-        .env("PATH", format!("{};{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("PATH", format!("{};C:\\Windows\\System32", fake.display()))
         .output()
         .expect("cardio binary should run");
     std::fs::remove_dir_all(&fake).ok();
