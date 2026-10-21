@@ -89,7 +89,7 @@ would sit). Pass value-flags first when unsure.
 | `--max-bytes-billed N` | bq only: errors out if the job would bill more than N bytes |
 | `--project ID` | bq only: project that runs the job (default: the CLI's configured project) |
 | `--bq-args "..."` | bq only: raw bq CLI flags passthrough (split on whitespace, no quotes inside) |
-| `--timeout SECS` | bq/gcloud/k8s: kill a hung fetcher (its job id stays in stderr). DEFAULT 600 s on any fetcher; --timeout N overrides, 0 disables |
+| `--timeout SECS` | kill a hung fetcher (its job id stays in stderr). DEFAULT 600 s on STREAMING fetchers (gcloud, k8s) — a stopped flow IS the hang. bq waits whole jobs: it needs an EXPLICIT --timeout (0 = disable) |
 | `--config FILE` | custom timestamp/boilerplate regexes and default_trace (TOML) |
 | `--mcp` | run as an MCP stdio server exposing these modes as tools (see cardio's README) |
 
@@ -127,7 +127,8 @@ against UTC bounds.
   printed. Without `--since`, it streams the whole matching range; a
   warning fires before the fetch.
 - `--k8s` mode: namespace and context are kubectl's own (current ones);
-  there is no --until pushdown (it filters locally).
+  kubectl runs with --timestamps so the local --until actually binds
+  (ts-less output would bypass the range filter entirely).
 - GKE pods: Cloud Logging has them as resource.type=k8s_container — the
   --gcloud path covers GKE clusters with full pushdown; --k8s talks to
   kubectl for plain clusters or local pods.

@@ -287,5 +287,5 @@ jobs:
           git clone -q --depth=1 --branch=gh-pages "$URL" ghp             || { mkdir ghp && git -C ghp init -q -b gh-pages && git -C ghp remote add origin "$URL"; }
           mv bench.svg bench.html bench.json ghp/
           git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add bench.svg bench.html bench.json
-          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "bench results: $(git rev-parse --short HEAD)" --allow-empty
+          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "bench results: ${GITHUB_SHA:0:12}" --allow-empty
           git -C ghp push -q origin gh-pages

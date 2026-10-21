@@ -209,7 +209,9 @@ fn main() {
         }
         eprintln!("Note: --max-lines is deprecated since 1.0.0 — use --tail for the window, --head for a trace-mode event cap.");
     }
-    args.max_lines = None;
+    // Resolve the deprecated value AFTER the mode is known: in window
+    // terms it moved to --tail, but 0.2.x also capped trace EVENTS with it
+    let deprecated_max_lines = args.max_lines.take();
     // explicitness before the window policy fills defaults in below:
     // the stderr notes only narrate DROPS the caller did not ask for
     let explicit_tail = args.tail.is_some();
@@ -308,7 +310,9 @@ fn main() {
     };
 
     if args.summary && trace_re.is_none() {
-        bail(Fail::Usage("--summary needs an ID pattern (--trace or config default_trace).".into()));
+        // exit 1, exactly as 0.2.x had it: wrappers key on this code
+        eprintln!("Error: --summary needs an ID pattern (--trace or config default_trace).");
+        exit(1);
     }
     if args.stats && trace_re.is_some() {
         eprintln!("Note: --stats is survey mode; --trace/--summary ignored.");
@@ -337,17 +341,34 @@ fn main() {
     // (no explicit flag, no --raw) caps at LEAN_MAX_LINES — fetchers keep
     // the HEAD (their query's ordering is the caller's intent), streams
     // keep the TAIL (recent beats old). trace-mode event caps share --head.
+    // 0.2.x's --max-lines had BOTH roles: window on streams, event cap in
+    // trace mode. Map to the role this run actually has, not one of them.
+    if let Some(n) = deprecated_max_lines {
+        if matches!(run, Run::Sessions) {
+            if args.head.is_none() { args.head = Some(n); }
+        } else if args.tail.is_none() {
+            args.tail = Some(n);
+        }
+    }
     if matches!(run, Run::Stream | Run::Sessions)
         && args.head.is_none() && args.tail.is_none()
         && !args.raw && !args.stats {
-            if child_tool.is_some() { args.head = Some(consts::LEAN_MAX_LINES); }
-            else { args.tail = Some(consts::LEAN_MAX_LINES); }
+            if matches!(run, Run::Sessions) || child_tool.is_some() {
+                // sessions collect events: the cap rides --head (both for
+                // files and fetchers); plain streams: tail for files,
+                // head for fetchers (the query's ordering is user intent)
+                args.head = Some(consts::LEAN_MAX_LINES);
+            } else {
+                args.tail = Some(consts::LEAN_MAX_LINES);
+            }
     }
     // Shared with the watchdog thread: main blocks on reads (not on the
     // mutex), so the watchdog can lock freely and kill a hung child.
     let child = fetched_child.map(|(_, c)| std::sync::Arc::new(std::sync::Mutex::new(c)));
-    // fetchers are protected by default: nobody should remember the guard
-    if args.timeout.is_none() && child_tool.is_some() {
+    // fetchers are protected by default — STREAMING ones only: a bq job
+    // sits silent until done (a wall-clock there kills legit long scans),
+    // while a gcloud/kubectl stream that stops flowing IS the hang
+    if args.timeout.is_none() && child_tool.is_some() && child_tool != Some("bq") {
         args.timeout = Some(consts::FETCH_TIMEOUT_DEFAULT);
     }
     if let (Some(secs), Some(arc)) = (args.timeout, &child) {
@@ -459,9 +480,9 @@ fn main() {
 
     if let Some(map) = result.stats_map {
         if args.json {
-            stats::print_json(&map, &mut outbuf);
+            stats::print_json(map, &mut outbuf);
         } else {
-            stats::print_table(&map);
+            stats::print_table(map);
         }
     }
     flush(&mut outbuf);

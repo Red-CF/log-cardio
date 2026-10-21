@@ -51,6 +51,9 @@ pub(crate) fn kill_fetcher(child: &mut Child) {
 
 /// --timeout watchdog: after `secs` of the child still being alive, kill
 /// the process group and say so. secs == 0 disables (explicit --timeout 0).
+/// Default policy (main's): STREAMING fetchers only (gcloud/k8s) — a bq
+/// job sits silent until done, so a wall-clock there kills legit long
+/// scans; bq needs an explicit --timeout.
 pub(crate) fn spawn_watchdog(child: &std::sync::Arc<std::sync::Mutex<Child>>, secs: u64) {
     if secs == 0 {
         return;
@@ -201,6 +204,10 @@ pub(crate) fn make_reader(
             eprintln!("Warning: no --since — this kubectl logs call streams from pod creation. Add --since unless you want everything.");
         }
         let mut k8s_args: Vec<String> = vec!["logs".into(), selector.clone()];
+        // --timestamps is REQUIRED for the local --until to exist: without
+        // it kubectl emits ts-less lines and the range filter bypasses
+        // timestamp-less lines entirely (silent no-op, review-caught)
+        k8s_args.push("--timestamps".into());
         if let Some(c) = &args.k8s_container {
             k8s_args.push("-c".into());
             k8s_args.push(c.clone());

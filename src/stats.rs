@@ -44,8 +44,10 @@ pub(crate) fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
 
 /// Same top-20 + deterministic count-desc/pattern-asc tie order for both
 /// forms. ponytail: O(n) top-20 partition, full sort only on the 20.
-pub(crate) fn sorted_top20(map: &HashMap<String, usize>) -> Vec<(String, usize)> {
-    let mut sorted: Vec<_> = map.clone().into_iter().collect();
+pub(crate) fn sorted_top20(map: HashMap<String, usize>) -> Vec<(String, usize)> {
+    // by value: the map dies right after the top-20 — no double clones of
+    // up to 100k pattern strings
+    let mut sorted: Vec<_> = map.into_iter().collect();
     let cmp = |a: &(String, usize), b: &(String, usize)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
     if sorted.len() > 20 {
         sorted.select_nth_unstable_by(19, cmp);
@@ -56,7 +58,7 @@ pub(crate) fn sorted_top20(map: &HashMap<String, usize>) -> Vec<(String, usize)>
 }
 
 /// stderr table (the human/agent default).
-pub(crate) fn print_table(map: &HashMap<String, usize>) {
+pub(crate) fn print_table(map: HashMap<String, usize>) {
     let sorted = sorted_top20(map);
     eprintln!("\n=== LOG PATTERN STATISTICS ===");
     for (p, c) in &sorted {
@@ -66,7 +68,7 @@ pub(crate) fn print_table(map: &HashMap<String, usize>) {
 }
 
 /// NDJSON on stdout (the machine channel).
-pub(crate) fn print_json(map: &HashMap<String, usize>, outbuf: &mut Sink) {
+pub(crate) fn print_json(map: HashMap<String, usize>, outbuf: &mut Sink) {
     for (p, c) in sorted_top20(map) {
         emit(outbuf, &serde_json::json!({"pattern": p, "count": c}).to_string());
     }

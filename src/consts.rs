@@ -12,6 +12,7 @@ pub(crate) const FIELD_LEN_DEFAULT: usize = 1000;
 /// --stats survey cap: unique patterns tracked before the counter stops
 pub(crate) const MAX_STATS_PATTERNS: usize = 100_000;
 
-/// --timeout default for fetchers: the 20-minute silent bq was real;
-/// agents should never have to remember the guard exists. 0 disables.
+/// --timeout default for STREAMING fetchers (gcloud/k8s): a stopped flow
+/// IS the hang. bq jobs sit silent until done, so bq opts in explicitly —
+/// a wall-clock there kills legit long scans. 0 disables entirely.
 pub(crate) const FETCH_TIMEOUT_DEFAULT: u64 = 600;

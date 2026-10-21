@@ -166,9 +166,10 @@ bq tips:
   `FORMAT_TIMESTAMP(...)` text; the same ISO bounds still apply locally.
 
 `--k8s`: a `kubectl logs` wrapper whose ONLY extra power is the pushdown
-(`--since` becomes `--since-time` in UTC; `--until` filters locally).
-The namespace and context are kubectl's own (current ones). Pass
-`pod/name`, `deployment/name` or a bare name; `-c` picks the container.
+(`--since` becomes `--since-time` in UTC; kubectl runs with
+`--timestamps` so `--until` can bind locally). The namespace and context
+are kubectl's own (current ones). Pass `pod/name`, `deployment/name` or
+a bare name; `-c` picks the container.
 
 Any OTHER provider needs nothing from cardio — the trim engine reads
 stdin:
@@ -213,7 +214,7 @@ cardio cache.txt --query NTS    # local re-queries cost no fetch
 | `--max-bytes-billed N` | bq only: hard cap on billed bytes (errors instead of scanning multi-TB tables). |
 | `--dry-run` | bq only: cost estimate only, reads no rows. |
 | `--bq-args "--flag=..."` | bq only: extra raw bq CLI flags (whitespace-split, no quotes inside). |
-| `--timeout SECS` | bq/gcloud/k8s: kill a hung fetcher after SECS (process-group kill; job id stays visible). Default 600 s on any fetcher; `0` disables. |
+| `--timeout SECS` | Kill a hung fetcher after SECS (process-group kill; job id stays visible). Default 600 s on STREAMING fetchers (gcloud, k8s); bq waits whole jobs, so it needs an explicit `--timeout`. `0` disables. |
 | `--config FILE` | TOML with `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
 | `--mcp` | Run as an MCP stdio server exposing these modes as tools (below). |
 | `--agent-md` | Print the agent-facing markdown card (pipe it: `cardio --agent-md > AGENTS.md`). |

@@ -46,15 +46,19 @@ printf '%-28s %s\n' "---" "----"
 if command -v hyperfine >/dev/null; then
     # -N = default shell (no user sh rc); style basic = the standard table
     # BENCH_JSON=path: machine-readable results (the CI bench badge reads it)
-    EXPORT=""
-    [ -n "${BENCH_JSON:-}" ] && EXPORT="--export-json $BENCH_JSON"
-    hyperfine --warmup 1 --min-runs 3 $EXPORT --style basic -N \
+    # export path rides as a real positional arg (quoted, no word-split)
+    if [ -n "${BENCH_JSON:-}" ]; then
+        set -- --export-json "$BENCH_JSON" "$@"
+    fi
+    set -- \
         "/bin/cat $LOG" \
         "$BIN $LOG" \
         "$BIN $LOG --raw" \
         "$BIN $LOG --stats" \
         "$BIN $LOG --query ERROR" \
-        "$BIN $LOG --raw --trace 'sid=([0-9]+)'" || true
+        "$BIN $LOG --raw --trace 'sid=([0-9]+)'" \
+        "$@"
+    hyperfine --warmup 1 --min-runs 3 --style basic -N "$@" || true
 else
     echo "hyperfine not installed (brew install hyperfine better) — plain timing:"
     for spec in \

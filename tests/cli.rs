@@ -1112,3 +1112,74 @@ fn win_k8s_since_pushdown() {
     assert!(err.contains("--since-time=2026-10-19T00:00:00Z"), "pushdown literal: {err:?}");
     assert!(err.contains("deployment/my-api"), "selector passed: {err:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn fetcher_default_window_keeps_head_not_tail() {
+    // the lean default for FETCHERS keeps the FIRST 2000 (the user's query
+    // ordering is their intent): rows past the cap drop, the head survives
+    let mut csv = String::from("timestamp,text\n");
+    for i in 0..2100 {
+        csv.push_str(&format!("2026-10-09T12:{:02}:{:02} row-{i:04}\n", i / 60, i % 60));
+    }
+    let out = fake_bq(&csv, &["--bq", "SELECT 1"]);
+    assert!(out.contains("row-0000"), "head keeps the first rows: {out:?}");
+    assert!(!out.contains("row-2099"), "tail rows beyond cap drop: {out:?}");
+    // explicit head lifts the early stop: the whole stream is READ
+    let (_, err) = fake_bq_argv(&csv, &[
+        "--bq", "SELECT 1", "--head", "2100",
+    ]);
+    assert!(err.contains("streamed 2100"), "explicit head reads all: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_pages_bq_results() {
+    let mut csv = String::from("timestamp,text\n");
+    for i in 0..20 {
+        csv.push_str(&format!("2026-10-09T12:00:{:02} row-{i:02}\n", i));
+    }
+    let page1 = fake_bq(&csv, &["--bq", "SELECT 1", "--head", "10"]);
+    assert!(page1.contains("row-00") && !page1.contains("row-10"), "page 1: {page1:?}");
+    let page2 = fake_bq(&csv, &["--bq", "SELECT 1", "--skip", "10", "--head", "10"]);
+    assert!(page2.contains("row-10") && page2.contains("row-19"), "page 2: {page2:?}");
+    assert!(!page2.contains("row-00"), "page 2 excludes page 1: {page2:?}");
+}
+
+#[test]
+fn trace_default_caps_events_at_head() {
+    // 0.2.x's default 2000-event cap in trace mode must survive the
+    // --max-lines removal: 2100 one-event sessions collect at most 2000
+    // (earliest win), and the run says the cap stopped the read
+    let mut content = String::new();
+    for i in 0..2100 {
+        content.push_str(&format!("2026-10-09T12:{:02}:{:02} req_id={i:04} event\n", i / 60, i % 60));
+    }
+    let path = fixture(&content);
+    let p = path.0.to_string_lossy().into_owned();
+    let (out, err) = cardio_out(&[&p, "--trace", "req_id=([a-z0-9-]+)", "--summary", "--json"]);
+    assert_eq!(out.lines().count(), 2000, "default head cap on sessions: {}", out.lines().count());
+    assert!(out.contains("\"id\":\"0050\"") || out.contains("id\":\"050"), "early ids kept: {out:?}");
+    assert!(err.contains("head cap (2000 lines)"), "cap witness: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_until_binds_locally_and_lines_carry_timestamps() {
+    // kubectl runs with --timestamps so the CLI's range filter can see the
+    // ts; --until must actually EXCLUDE (the review-caught silent no-op)
+    let out = run_with_fake(
+        "kubectl",
+        "#!/bin/sh\necho \"ARGS:$*\" >&2\necho \"2026-10-19T10:00:00Z in-window\"\necho \"2026-10-20T10:00:00Z out-window\"\n",
+        // padded precision = exclusive instant (a raw DATE means the whole
+        // end day is KEPT — the documented --until convention)
+        &["--k8s", "deployment/my-api", "--since", "2026-10-19", "--until", "2026-10-20T00:00:00"],
+    );
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("in-window"), "kept: {stdout:?}");
+    assert!(!stdout.contains("out-window"), "--until EXCLUDES (was a silent no-op): {stdout:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--timestamps"), "ts line format on for local bounds: {err:?}");
+    assert!(err.contains("--since-time=2026-10-19T00:00:00Z"), "since pushdown intact: {err:?}");
+}
