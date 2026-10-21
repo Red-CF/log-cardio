@@ -1027,3 +1027,88 @@ fn last_year_final_second_fracs_survive_until() {
     assert!(out.contains("day"), "got: {out:?}");
     assert!(out.contains("last instant"), "mid-second instant stays under the clamp, got: {out:?}");
 }
+
+// ---- Windows fetcher fakes: the CI runs these paths on Windows too ----
+// The unix stubs are `sh` scripts; here they are .cmd batches with the
+// same recipes: a fixed CSV on stdout, argv echoed to stderr, one that
+// exits nonzero, one that sleeps (ping trick), one kubectl echoing args.
+
+#[cfg(windows)]
+fn run_with_fake(tool: &str, bat_body: &str, args: &[&str]) -> std::process::Output {
+    let fake = std::env::temp_dir().join(format!(
+        "cardio_fakebin_{}_{}",
+        tool,
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join(format!("{tool}.cmd"));
+    std::fs::write(&script, bat_body).expect("write fake script");
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(args)
+        .env("PATH", format!("{};{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    out
+}
+
+#[cfg(windows)]
+#[test]
+fn win_bq_csv_rows_flow_and_join_tab() {
+    let out = run_with_fake(
+        "bq",
+        "@echo off\r\necho timestamp,text\r\necho e1,x\r\necho e1,x\r\n",
+        &["--bq", "SELECT 1", "--raw"],
+    );
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 2, "header skipped: {stdout:?}");
+    assert!(stdout.contains("e1\tx"), "tab join: {stdout:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn win_fetcher_failure_exits_nonzero() {
+    let out = run_with_fake(
+        "bq",
+        "@echo off\r\necho timestamp,text\r\necho job_abc\r\nexit /b 1\r\n",
+        &["--bq", "SELECT 1", "--raw"],
+    );
+    assert!(!out.status.success(), "failure must propagate");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("bq exited"),
+        "fetcher failure reported: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn win_timeout_kills_a_hung_fetcher() {
+    // ping -n N = sleep ~N-1 seconds; the watchdog must kill it at 1s
+    let out = run_with_fake(
+        "bq",
+        "@echo off\r\necho timestamp,text\r\necho row one\r\nping -n 30 127.0.0.1 >NUL\r\n",
+        &["--bq", "SELECT 1", "--raw", "--timeout", "1"],
+    );
+    assert!(!out.status.success(), "killed run must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("killed after --timeout 1s"),
+        "timeout notice: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn win_k8s_since_pushdown() {
+    let out = run_with_fake(
+        "kubectl",
+        "@echo off\r\necho ARGS:%* 1>&2\r\n",
+        &["--k8s", "deployment/my-api", "--since", "2026-10-19"],
+    );
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--since-time=2026-10-19T00:00:00Z"), "pushdown literal: {err:?}");
+    assert!(err.contains("deployment/my-api"), "selector passed: {err:?}");
+}

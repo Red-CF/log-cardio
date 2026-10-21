@@ -89,7 +89,7 @@ would sit). Pass value-flags first when unsure.
 | `--max-bytes-billed N` | bq only: errors out if the job would bill more than N bytes |
 | `--project ID` | bq only: project that runs the job (default: the CLI's configured project) |
 | `--bq-args "..."` | bq only: raw bq CLI flags passthrough (split on whitespace, no quotes inside) |
-| `--timeout SECS` | bq/gcloud/k8s: kill a hung fetcher (its job id stays in stderr) |
+| `--timeout SECS` | bq/gcloud/k8s: kill a hung fetcher (its job id stays in stderr). DEFAULT 600 s on any fetcher; --timeout N overrides, 0 disables |
 | `--config FILE` | custom timestamp/boilerplate regexes and default_trace (TOML) |
 | `--mcp` | run as an MCP stdio server exposing these modes as tools (see cardio's README) |
 

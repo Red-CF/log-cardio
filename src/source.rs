@@ -49,6 +49,64 @@ pub(crate) fn kill_fetcher(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// --timeout watchdog: after `secs` of the child still being alive, kill
+/// the process group and say so. secs == 0 disables (explicit --timeout 0).
+pub(crate) fn spawn_watchdog(child: &std::sync::Arc<std::sync::Mutex<Child>>, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let watchdog = std::sync::Arc::clone(child);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let Ok(mut c) = watchdog.lock() else { return };
+        match c.try_wait() {
+            // reaped or gone: nothing to kill (kill on a reaped pid could
+            // hit an unrelated process)
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => {
+                kill_fetcher(&mut c);
+                eprintln!("Error: fetcher killed after --timeout {}s (its job id is visible in the output above).", secs);
+            }
+        }
+    });
+}
+
+/// Reap the fetcher after the run: kill on our own early cut, then poll
+/// try_wait without ever holding the mutex across a sleep (the watchdog
+/// needs the lock; a guard held across the poll-sleep deadlocks it).
+/// Failures of the child itself propagate as Fail::Fetch.
+pub(crate) fn collect_fetcher(
+    child: &std::sync::Arc<std::sync::Mutex<Child>>,
+    tool: Option<&'static str>,
+    early_cut: bool,
+) -> Result<(), crate::errors::Fail> {
+    if early_cut {
+        let mut g = child.lock().unwrap();
+        kill_fetcher(&mut g);
+    }
+    let status;
+    loop {
+        let probed = { child.lock().unwrap().try_wait() };
+        match probed {
+            Ok(Some(s)) => { status = Some(s); break; }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                eprintln!("Warning: failed to wait for {}: {}", tool.unwrap_or("fetcher"), e);
+                status = None;
+                break;
+            }
+        }
+    }
+    let Some(status) = status else { return Ok(()) };
+    if !status.success() && !early_cut {
+        // Propagate: scripts piping cardio must see fetch failures.
+        // (An early-cut kill is OUR failure, already reported — ignore it.)
+        return Err(crate::errors::Fail::Fetch(format!(
+            "{} exited with {}", tool.unwrap_or("fetcher"), status)));
+    }
+    Ok(())
+}
+
 /// Spawn gcloud / bq / open file / stdin. Returns the input source and any
 /// child fetcher we own. gcloud mode pushes canonical time bounds into the
 /// SERVER-side filter (valid ISO by is_full_iso) to avoid downloading months

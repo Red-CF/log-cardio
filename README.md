@@ -213,7 +213,7 @@ cardio cache.txt --query NTS    # local re-queries cost no fetch
 | `--max-bytes-billed N` | bq only: hard cap on billed bytes (errors instead of scanning multi-TB tables). |
 | `--dry-run` | bq only: cost estimate only, reads no rows. |
 | `--bq-args "--flag=..."` | bq only: extra raw bq CLI flags (whitespace-split, no quotes inside). |
-| `--timeout SECS` | bq/gcloud/k8s: kill a hung fetcher after SECS (process-group kill; its job id stays visible on stderr). |
+| `--timeout SECS` | bq/gcloud/k8s: kill a hung fetcher after SECS (process-group kill; job id stays visible). Default 600 s on any fetcher; `0` disables. |
 | `--config FILE` | TOML with `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
 | `--mcp` | Run as an MCP stdio server exposing these modes as tools (below). |
 | `--agent-md` | Print the agent-facing markdown card (pipe it: `cardio --agent-md > AGENTS.md`). |
@@ -294,7 +294,7 @@ time would measure the cap rather than the grouper.
 ## Tests
 
 ```bash
-cargo test    # 63 integration: tests/cli.rs + tests/mcp.rs, and 1 unit (src/timestamps.rs)
+cargo test    # unit + integration: the CLI contract (tests/cli.rs), a real MCP stdio drive (tests/mcp.rs), fake fetchers per OS (sh stubs on unix, .cmd stubs on Windows)
 ```
 
 Philosophy: black-box, at the CLI level. Tests pin the promises the

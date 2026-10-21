@@ -1,36 +1,29 @@
-//! cardio — trim noise from logs for LLM agents. Mode wiring lives here;
-//! pipeline/sessions/source/timestamps each own their layer (see the
-//! module docs). Keep main.rs the smallest file: new behavior belongs in
-//! the layer it affects.
+//! cardio — trim noise from logs for LLM agents. main.rs is PURE
+//! orchestration: parse, validate, wire, call the layer that owns the
+//! behavior (pipeline/sessions/source/timestamps/notes/stats), emit the
+//! witnesses. New behavior belongs in the layer it affects; the exit
+//! contract lives in errors::Fail; tuning knobs in consts.
 
 mod agent_md;
+mod consts;
+mod errors;
 mod mcp;
+mod notes;
 mod pipeline;
 mod sessions;
 mod source;
+mod stats;
 mod timestamps;
 
 use clap::Parser;
+use errors::{Fail, bail};
 use regex::Regex;
-use sessions::{Run, RunResult, emit_sessions};
+use sessions::Run;
 use pipeline::{Pipeline, Sink, flush, run_stream};
-use source::make_reader;
-use std::collections::HashMap;
+use source::{collect_fetcher, make_reader, spawn_watchdog};
 use std::io;
 use std::process::exit;
-use std::sync::LazyLock;
 use timestamps::{TRIM_BODY, canonical_bound, is_full_iso};
-
-/// --stats survey cap: unique patterns tracked before the counter stops
-const MAX_STATS_PATTERNS: usize = 100_000;
-/// --lean output cap: enough events for a debugging session, small
-/// enough that an agent never swallows a token wall by accident.
-/// lean window size; the SIDE depends on the source (fetcher = head,
-/// stream = tail) — run_stream implements the pairing
-pub(crate) const LEAN_MAX_LINES: usize = 2_000;
-/// lean default field cut: JWTs/payloads that never carry an id in their
-/// tail get marked with an ellipsis instead of eating context; 0 disables
-const FIELD_LEN_DEFAULT: usize = 1000;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Trim noise from logs for LLM agents")]
@@ -131,9 +124,10 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) bq_args: Option<String>,
 
-    /// Kill the gcloud/bq fetcher after this many seconds — a hung child
-    /// (a 20-minute silent bq was seen for real) otherwise blocks forever;
-    /// its job id stays in stderr for later retrieval
+    /// Kill the fetcher after this many seconds (default FETCH_TIMEOUT_
+    /// DEFAULT for fetchers; 0 disables) — a hung child (a 20-minute
+    /// silent bq was seen for real) otherwise blocks forever; its job id
+    /// stays in stderr for later retrieval
     #[arg(long)]
     pub(crate) timeout: Option<u64>,
 
@@ -178,44 +172,8 @@ struct CardConfig {
 
 fn compile_regex(pattern: &str, source: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|e| {
-        eprintln!("Invalid regex {} {:?}: {}", source, pattern, e);
-        exit(1);
+        bail(Fail::Source(format!("Invalid regex {} {:?}: {}", source, pattern, e)))
     })
-}
-
-/// --stats folds digit runs to '#' before counting: "sid=123" and
-/// "sid=456" are ONE pattern to the survey, not two (three agents hit
-/// per-UUID floods that told them nothing). Dedup keeps exact lines.
-static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new("[0-9]+").unwrap());
-
-/// Stats mode: survey the whole file; returns counts + whether capped.
-fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
-    let mut stats_map: HashMap<String, usize> = HashMap::new();
-    let mut key_buf = String::new(); // reused fold buffer, read via `key` alias
-    let mut capped = false;
-    while let Some((_, line)) = proc.next_trimmed() {
-        // get_mut fast path — no String alloc for a line already seen.
-        // Cap gates only new insertions; existing counters keep advancing.
-        // Cap the key (--max-field-len) before folding: stats entries hold
-        // whole lines, and the cap is what keeps huge bodies bounded here.
-        let line = proc.clamp_fields(&line);
-        let fold = line.bytes().any(|b| b.is_ascii_digit());
-        let key: &str = if fold {
-            key_buf.clear();
-            key_buf.push_str(&DIGIT_RUN.replace_all(&line, "#"));
-            &key_buf
-        } else {
-            &line
-        };
-        if let Some(c) = stats_map.get_mut(key) {
-            *c += 1;
-        } else if stats_map.len() < MAX_STATS_PATTERNS {
-            stats_map.insert(key.to_string(), 1);
-        } else {
-            capped = true;
-        }
-    }
-    (stats_map, capped)
 }
 
 fn main() {
@@ -258,14 +216,13 @@ fn main() {
     let explicit_head = args.head.is_some();
     let dedup = args.dedup || !args.raw;
     if !args.raw {
-        args.max_field_len = args.max_field_len.or(Some(FIELD_LEN_DEFAULT));
+        args.max_field_len = args.max_field_len.or(Some(consts::FIELD_LEN_DEFAULT));
     }
     if args.max_field_len == Some(0) {
         args.max_field_len = None; // explicit "unlimited fields"
     }
     if args.head.is_some() && args.tail.is_some() {
-        eprintln!("Error: --head and --tail are both windows; pass at most one.");
-        exit(2);
+        bail(Fail::Usage("--head and --tail are both windows; pass at most one.".into()));
     }
 
     // exactly one source: file / gcloud / bq / k8s
@@ -279,8 +236,7 @@ fn main() {
     .filter(|b| **b)
     .count();
     if sources > 1 {
-        eprintln!("Error: pass only one source: a file path, --gcloud, --bq, or --k8s.");
-        exit(1);
+        bail(Fail::Source("pass only one source: a file path, --gcloud, --bq, or --k8s.".into()));
     }
 
     // Fail fast on unusable time bounds: warn-and-stream would pour an
@@ -289,11 +245,9 @@ fn main() {
     for (label, bound) in [("since", &args.since), ("until", &args.until)] {
         if let Some(b) = bound
             && !is_full_iso(b) {
-                eprintln!(
-                    "Error: --{} {:?} is not a full ISO date (YYYY-MM-DD or with time).",
-                    label, b
-                );
-                exit(2);
+                bail(Fail::Usage(format!(
+                    "--{label} {b:?} is not a full ISO date (YYYY-MM-DD or with time)."
+                )));
             }
     }
 
@@ -306,28 +260,21 @@ fn main() {
     ];
     if args.bq.is_none()
         && let Some((flag, _)) = bq_only.into_iter().find(|(_, used)| *used) {
-            eprintln!("Error: {flag} only works with --bq.");
-            exit(2);
+            bail(Fail::Usage(format!("{flag} only works with --bq.")));
         }
     if args.timeout.is_some()
         && args.bq.is_none() && args.gcloud.is_none() && args.k8s.is_none() {
-        eprintln!("Error: --timeout only works with --bq, --gcloud, or --k8s.");
-        exit(2);
+        bail(Fail::Usage("--timeout only works with --bq, --gcloud, or --k8s.".into()));
     }
     if args.k8s_container.is_some() && args.k8s.is_none() {
-        eprintln!("Error: -c/--container only works with --k8s.");
-        exit(2);
+        bail(Fail::Usage("-c/--container only works with --k8s.".into()));
     }
 
     let config = args.config.as_ref().map(|p| {
-        let s = std::fs::read_to_string(p).unwrap_or_else(|e| {
-            eprintln!("Error reading config {}: {}", p, e);
-            exit(1);
-        });
-        toml::from_str::<CardConfig>(&s).unwrap_or_else(|e| {
-            eprintln!("Error parsing config {}: {}", p, e);
-            exit(1);
-        })
+        let s = std::fs::read_to_string(p)
+            .unwrap_or_else(|e| bail(Fail::Source(format!("reading config {p}: {e}"))));
+        toml::from_str::<CardConfig>(&s)
+            .unwrap_or_else(|e| bail(Fail::Source(format!("parsing config {p}: {e}"))))
     }).unwrap_or_default();
 
     // Compile ALL regexes BEFORE spawning gcloud: a bad pattern must not
@@ -361,8 +308,7 @@ fn main() {
     };
 
     if args.summary && trace_re.is_none() {
-        eprintln!("Error: --summary needs an ID pattern (--trace or config default_trace).");
-        exit(1);
+        bail(Fail::Usage("--summary needs an ID pattern (--trace or config default_trace).".into()));
     }
     if args.stats && trace_re.is_some() {
         eprintln!("Note: --stats is survey mode; --trace/--summary ignored.");
@@ -394,27 +340,18 @@ fn main() {
     if matches!(run, Run::Stream | Run::Sessions)
         && args.head.is_none() && args.tail.is_none()
         && !args.raw && !args.stats {
-            if child_tool.is_some() { args.head = Some(LEAN_MAX_LINES); }
-            else { args.tail = Some(LEAN_MAX_LINES); }
+            if child_tool.is_some() { args.head = Some(consts::LEAN_MAX_LINES); }
+            else { args.tail = Some(consts::LEAN_MAX_LINES); }
     }
     // Shared with the watchdog thread: main blocks on reads (not on the
     // mutex), so the watchdog can lock freely and kill a hung child.
     let child = fetched_child.map(|(_, c)| std::sync::Arc::new(std::sync::Mutex::new(c)));
+    // fetchers are protected by default: nobody should remember the guard
+    if args.timeout.is_none() && child_tool.is_some() {
+        args.timeout = Some(consts::FETCH_TIMEOUT_DEFAULT);
+    }
     if let (Some(secs), Some(arc)) = (args.timeout, &child) {
-        let watchdog = std::sync::Arc::clone(arc);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            let Ok(mut c) = watchdog.lock() else { return };
-            match c.try_wait() {
-                // reaped or gone: nothing to kill (kill on a reaped pid could
-                // hit an unrelated process)
-                Ok(Some(_)) | Err(_) => {}
-                Ok(None) => {
-                    crate::source::kill_fetcher(&mut c);
-                    eprintln!("Error: fetcher killed after --timeout {}s (its job id is visible in the output above).", secs);
-                }
-            }
-        });
+        spawn_watchdog(arc, secs);
     }
 
     let mut proc = Pipeline {
@@ -442,8 +379,8 @@ fn main() {
 
     let result = match run {
         Run::Stats => {
-            let (map, capped) = run_stats(&mut proc);
-            RunResult {
+            let (map, capped) = stats::run_stats(&mut proc);
+            sessions::RunResult {
                 stats_map: Some(map),
                 sessions: None,
                 stats_capped: capped,
@@ -457,7 +394,7 @@ fn main() {
         Run::Sessions => {
             let (map, sessions_capped, session_lines_capped) =
                 sessions::collect_sessions(&mut proc, &args, trace_re.as_ref().unwrap());
-            RunResult {
+            sessions::RunResult {
                 stats_map: None,
                 sessions: Some(map),
                 stats_capped: false,
@@ -470,7 +407,7 @@ fn main() {
         }
         Run::Stream => {
             let (dedup_inserts, dropped_dups, window_full) = run_stream(&mut proc, dedup, &args, &mut outbuf);
-            RunResult {
+            sessions::RunResult {
                 stats_map: None,
                 sessions: None,
                 stats_capped: false,
@@ -496,135 +433,45 @@ fn main() {
 
     flush(&mut outbuf);
 
-    // Honest stderr signals: the default pipeline drops and caps, so the
-    // agent (or the person reading the log) must SEE exactly what was
-    // given up — never silently.
-    if result.dropped_dups > 0 {
-        eprintln!(
-            "Note: dedup dropped {} repeat line{}. Under the 5000-unique-lines mark dedup is exact; above it, a few may actually be unique (--raw keeps everything).",
-            result.dropped_dups,
-            if result.dropped_dups == 1 { "" } else { "s" }
-        );
-    }
-    if result.window_full && !explicit_tail {
-        eprintln!(
-            "Note: kept the last {} lines — the most recent; the rest of the input was read and trimmed (--raw removes the cap; --query TEXT narrows before reading).",
-            LEAN_MAX_LINES
-        );
-    }
-    if early_cut {
-        eprintln!(
-            "Note: output stopped at the head cap ({} lines); the rest of the input was not read.{}",
-            args.head.unwrap_or(LEAN_MAX_LINES),
-            if explicit_head { "" } else { " (the lean default; --raw removes it)" }
-        );
-    }
-    if result.dedup_inserts > 10_000_000 {
-        eprintln!("Warning: --dedup exceeded 10M unique lines; bloom filter is saturated and unique lines may be dropped as false duplicates.");
-    }
-    if let Some(tool) = child_tool
-        && empty_entries > 0 {
-            eprintln!("Note: {} empty entr{} from {} were skipped.", empty_entries, if empty_entries == 1 { "y" } else { "ies" }, tool);
-        }
-    // Real-agent feedback: an empty result looked like a failure because
-    // nothing said otherwise. EVERY fetcher run states its volume — zero
-    // included — so 0 rows has a witness; the job id is already in stderr
-    // from the child.
-    if let Some(tool) = child_tool {
-        eprintln!("Note: {} streamed {} line{}.", tool, stopped_at_line, if stopped_at_line == 1 { "" } else { "s" });
-    }
-    if result.stats_capped {
-        eprintln!("Warning: --stats reached its {} unique-pattern cap; later patterns untracked (existing counts are complete).", MAX_STATS_PATTERNS);
-    }
-    if result.sessions_capped {
-        eprintln!("Warning: trace session cap ({}) reached; later sessions not collected.", sessions::MAX_TRACE_SESSIONS);
-    }
-    if result.session_lines_capped {
-        eprintln!("Warning: some sessions hit the {}-line cap; their tails were cut.", sessions::MAX_LINES_PER_SESSION);
-    }
+    let sessions_top_dropped = if let Some(sessions_map) = &result.sessions {
+        let dropped = sessions::emit_sessions(sessions_map, args.top, args.json, &mut outbuf);
+        flush(&mut outbuf);
+        dropped
+    } else {
+        0
+    };
+
+    notes::emit(
+        &notes::Notes {
+            explicit_tail,
+            explicit_head,
+            head_size: args.head.unwrap_or(consts::LEAN_MAX_LINES),
+            child_tool,
+            early_cut,
+            stopped_at_line,
+            empty_entries,
+        },
+        &result,
+        sessions_top_dropped,
+        args.json,
+        args.top.unwrap_or(0),
+    );
 
     if let Some(map) = result.stats_map {
-        // Count desc, then pattern asc = deterministic ties
-        let mut sorted: Vec<_> = map.into_iter().collect();
-        let cmp = |a: &(String, usize), b: &(String, usize)| b.1.cmp(&a.1).then(a.0.cmp(&b.0));
-        // ponytail: O(n) top-20 partition, full sort only on the 20 printed
-        if sorted.len() > 20 {
-            sorted.select_nth_unstable_by(19, cmp);
-        }
-        sorted.truncate(20);
-        sorted.sort_by(cmp);
         if args.json {
-            // Machine-readable survey: NDJSON on stdout, the agent's
-            // channel. Same top-20 + deterministic tie order as the
-            // stderr table.
-            for (p, c) in &sorted {
-                pipeline::emit(&mut outbuf, &serde_json::json!({"pattern": p, "count": c}).to_string());
-            }
+            stats::print_json(&map, &mut outbuf);
         } else {
-            eprintln!("\n=== LOG PATTERN STATISTICS ===");
-            for (p, c) in &sorted {
-                eprintln!("{:>7} | {}", c, p);
-            }
-            eprintln!("==============================");
-        }
-    }
-
-    if let Some(sessions_map) = result.sessions {
-        let dropped = emit_sessions(&sessions_map, args.top, args.json, &mut outbuf);
-        // text mode already carries the count inside its output header;
-        // the json stream must stay clean — this note is its witness only
-        if args.json && dropped > 0 {
-            eprintln!(
-                "Note: {} smaller session{} dropped (--top {}).",
-                dropped, if dropped == 1 { "" } else { "s" }, args.top.unwrap_or(0)
-            );
+            stats::print_table(&map);
         }
     }
     flush(&mut outbuf);
 
-    // We cut the stream early (--head window / --timeout): kill the fetcher
-    // outright. Rust ignores SIGPIPE and children inherit it, so gcloud
-    // would die on EPIPE with a nonzero exit — reported as a failure we
-    // caused.
-    if early_cut
-        && let Some(child) = &child {
-            let mut g = child.lock().unwrap();
-            source::kill_fetcher(&mut g);
+    // Fetch failures propagate: scripts piping cardio must see them
+    // (an early-cut kill is OUR failure, already reported — ignored).
+    if let Some(child) = &child
+        && let Err(f) = collect_fetcher(child, child_tool, early_cut) {
+            bail(f);
         }
-    if let Some(child) = &child {
-        // Poll try_wait with the mutex held per iteration only: holding it
-        // across a blocking wait() would deadlock the --timeout watchdog
-        // in exactly the hang cases it exists for (child alive, stdout
-        // closed, main parked in wait()).
-        let status;
-        loop {
-            // scoped block: the MutexGuard must NOT outlive try_wait — a
-            // guard held across the sleep arm would keep the watchdog
-            // waiting on the lock forever (match temporaries live until
-            // the arms complete, so a naked match scrutinee deadlocks)
-            let probed = { child.lock().unwrap().try_wait() };
-            match probed {
-                Ok(Some(s)) => { status = Some(s); break; }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
-                Err(e) => {
-                    eprintln!("Warning: failed to wait for {}: {}", child_tool.unwrap_or("fetcher"), e);
-                    status = None;
-                    break;
-                }
-            }
-        }
-        let status = status.unwrap();
-        if !status.success() {
-            if early_cut {
-                // already reported above; ignore the failure we caused
-                // (EPIPE from killing the fetcher)
-            } else {
-                // Propagate: scripts piping cardio must see fetch failures
-                eprintln!("Error: {} exited with {}", child_tool.unwrap_or("fetcher"), status);
-                exit(1);
-            }
-        }
-    }
 
     if read_error.is_some() {
         // Truncated input is a failure even though we emitted partial results
