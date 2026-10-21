@@ -535,7 +535,7 @@ fn agent_md_prints_card() {
 
 #[test]
 fn default_pipeline_dedups_and_caps_raw_skips_it() {
-    // lean is the default: dedup on + --max-lines 2000 (overridable);
+    // lean is the default: dedup on + a 2000-line window (overridable);
     // --raw = no dedup, no cap. Repeats must collapse and the cap must
     // apply without any flag
     let mut content = String::new();
@@ -554,8 +554,8 @@ fn default_pipeline_dedups_and_caps_raw_skips_it() {
     let count = out.matches("repeated start").count();
     assert_eq!(count, 0, "head of the range must leave the window, got {count}");
     assert!(out.contains("unique-2099") && !out.contains("unique-0099"), "cap 2000 must keep the most recent");
-    // explicit --max-lines overrides the default cap (same tail semantics)
-    let capped = cardio(&["--max-lines", "5", &p]);
+    // an explicit --tail overrides the same way
+    let capped = cardio(&["--tail", "5", &p]);
     assert_eq!(capped.lines().count(), 5, "got {}", capped.lines().count());
     assert!(capped.contains("unique-2099"), "explicit cap keeps the latest: {capped:?}");
     // --raw: no dedup, no cap — both repeats and every unique survive
@@ -601,7 +601,7 @@ fn lean_signals_what_it_dropped() {
         .expect("cardio binary should run");
     assert!(out.status.success(), "got: {:?}", out.status);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("dedup dropped 1 duplicate-suspect line"), "got: {err:?}");
+    assert!(err.contains("dedup dropped 1 repeat line"), "got: {err:?}");
     assert!(!err.contains("kept the last"), "no cap in a short run: {err:?}");
 
     let big: String = (0..2001).map(|i| format!("2026-10-09T12:{:02}:{:02} u{i:04}\n", i / 60, i % 60)).collect();
@@ -955,7 +955,7 @@ fn timeout_errors_without_a_fetcher() {
         .expect("cardio binary should run");
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("only works with --bq or --gcloud"),
+        String::from_utf8_lossy(&out.stderr).contains("only works with --bq, --gcloud, or --k8s"),
         "usage error missing: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -1026,4 +1026,165 @@ fn last_year_final_second_fracs_survive_until() {
 
     assert!(out.contains("day"), "got: {out:?}");
     assert!(out.contains("last instant"), "mid-second instant stays under the clamp, got: {out:?}");
+}
+
+// ---- Windows fetcher fakes: the CI runs these paths on Windows too ----
+// The unix stubs are `sh` scripts; here they are .cmd batches with the
+// same recipes: a fixed CSV on stdout, argv echoed to stderr, one that
+// exits nonzero, one that sleeps (ping trick), one kubectl echoing args.
+
+#[cfg(windows)]
+fn run_with_fake(tool: &str, bat_body: &str, args: &[&str]) -> std::process::Output {
+    let fake = std::env::temp_dir().join(format!(
+        "cardio_fakebin_{}_{}",
+        tool,
+        FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&fake).expect("mkdir fakebin");
+    let script = fake.join(format!("{tool}.cmd"));
+    std::fs::write(&script, bat_body).expect("write fake script");
+    // PATH = ONLY the fake dir (+ System32 for batch builtins like ping):
+    // a real kubectl.exe/bq.exe elsewhere in the inherited PATH would WIN
+    // the spawn search before our kubectl.cmd shim ever mattered, and the
+    // test would drive a live binary against a nonexistent cluster
+    // (exactly what the first Windows run caught).
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(args)
+        .env("PATH", format!("{};C:\\Windows\\System32", fake.display()))
+        .output()
+        .expect("cardio binary should run");
+    std::fs::remove_dir_all(&fake).ok();
+    out
+}
+
+#[cfg(windows)]
+#[test]
+fn win_bq_csv_rows_flow_and_join_tab() {
+    let out = run_with_fake(
+        "bq",
+        "@echo off\r\necho timestamp,text\r\necho e1,x\r\necho e1,x\r\n",
+        &["--bq", "SELECT 1", "--raw"],
+    );
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 2, "header skipped: {stdout:?}");
+    assert!(stdout.contains("e1\tx"), "tab join: {stdout:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn win_fetcher_failure_exits_nonzero() {
+    let out = run_with_fake(
+        "bq",
+        "@echo off\r\necho timestamp,text\r\necho job_abc\r\nexit /b 1\r\n",
+        &["--bq", "SELECT 1", "--raw"],
+    );
+    assert!(!out.status.success(), "failure must propagate");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("bq exited"),
+        "fetcher failure reported: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn win_timeout_kills_a_hung_fetcher() {
+    // ping -n N = sleep ~N-1 seconds; the watchdog must kill it at 1s
+    let out = run_with_fake(
+        "bq",
+        "@echo off\r\necho timestamp,text\r\necho row one\r\nping -n 30 127.0.0.1 >NUL\r\n",
+        &["--bq", "SELECT 1", "--raw", "--timeout", "1"],
+    );
+    assert!(!out.status.success(), "killed run must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("killed after --timeout 1s"),
+        "timeout notice: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn win_k8s_since_pushdown() {
+    let out = run_with_fake(
+        "kubectl",
+        "@echo off\r\necho ARGS:%* 1>&2\r\n",
+        &["--k8s", "deployment/my-api", "--since", "2026-10-19"],
+    );
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--since-time=2026-10-19T00:00:00Z"), "pushdown literal: {err:?}");
+    assert!(err.contains("deployment/my-api"), "selector passed: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fetcher_default_window_keeps_head_not_tail() {
+    // the lean default for FETCHERS keeps the FIRST 2000 (the user's query
+    // ordering is their intent): rows past the cap drop, the head survives
+    let mut csv = String::from("timestamp,text\n");
+    for i in 0..2100 {
+        csv.push_str(&format!("2026-10-09T12:{:02}:{:02} row-{i:04}\n", i / 60, i % 60));
+    }
+    let out = fake_bq(&csv, &["--bq", "SELECT 1"]);
+    assert!(out.contains("row-0000"), "head keeps the first rows: {out:?}");
+    assert!(!out.contains("row-2099"), "tail rows beyond cap drop: {out:?}");
+    // explicit head lifts the early stop: the whole stream is READ
+    let (_, err) = fake_bq_argv(&csv, &[
+        "--bq", "SELECT 1", "--head", "2100",
+    ]);
+    assert!(err.contains("streamed 2100"), "explicit head reads all: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_pages_bq_results() {
+    let mut csv = String::from("timestamp,text\n");
+    for i in 0..20 {
+        csv.push_str(&format!("2026-10-09T12:00:{:02} row-{i:02}\n", i));
+    }
+    let page1 = fake_bq(&csv, &["--bq", "SELECT 1", "--head", "10"]);
+    assert!(page1.contains("row-00") && !page1.contains("row-10"), "page 1: {page1:?}");
+    let page2 = fake_bq(&csv, &["--bq", "SELECT 1", "--skip", "10", "--head", "10"]);
+    assert!(page2.contains("row-10") && page2.contains("row-19"), "page 2: {page2:?}");
+    assert!(!page2.contains("row-00"), "page 2 excludes page 1: {page2:?}");
+}
+
+#[test]
+fn trace_default_caps_events_at_head() {
+    // 0.2.x's default 2000-event cap in trace mode must survive the
+    // --max-lines removal: 2100 one-event sessions collect at most 2000
+    // (earliest win), and the run says the cap stopped the read
+    let mut content = String::new();
+    for i in 0..2100 {
+        content.push_str(&format!("2026-10-09T12:{:02}:{:02} req_id={i:04} event\n", i / 60, i % 60));
+    }
+    let path = fixture(&content);
+    let p = path.0.to_string_lossy().into_owned();
+    let (out, err) = cardio_out(&[&p, "--trace", "req_id=([a-z0-9-]+)", "--summary", "--json"]);
+    assert_eq!(out.lines().count(), 2000, "default head cap on sessions: {}", out.lines().count());
+    assert!(out.contains("\"id\":\"0050\"") || out.contains("id\":\"050"), "early ids kept: {out:?}");
+    assert!(err.contains("head cap (2000 lines)"), "cap witness: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_until_binds_locally_and_lines_carry_timestamps() {
+    // kubectl runs with --timestamps so the CLI's range filter can see the
+    // ts; --until must actually EXCLUDE (the review-caught silent no-op)
+    let out = run_with_fake(
+        "kubectl",
+        "#!/bin/sh\necho \"ARGS:$*\" >&2\necho \"2026-10-19T10:00:00Z in-window\"\necho \"2026-10-20T10:00:00Z out-window\"\n",
+        // padded precision = exclusive instant (a raw DATE means the whole
+        // end day is KEPT — the documented --until convention)
+        &["--k8s", "deployment/my-api", "--since", "2026-10-19", "--until", "2026-10-20T00:00:00"],
+    );
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("in-window"), "kept: {stdout:?}");
+    assert!(!stdout.contains("out-window"), "--until EXCLUDES (was a silent no-op): {stdout:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--timestamps"), "ts line format on for local bounds: {err:?}");
+    assert!(err.contains("--since-time=2026-10-19T00:00:00Z"), "since pushdown intact: {err:?}");
 }

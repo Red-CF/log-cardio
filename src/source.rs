@@ -23,16 +23,36 @@ pub(crate) enum Source {
 /// orphan died of old age (a 30 s "hung" run was exactly this).
 /// Returns (raw stdout pipe, child we own for wait/kill).
 pub(crate) fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) {
-    let mut cmd = Command::new(tool);
-    cmd.args(&argv)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = cmd.spawn().unwrap_or_else(|e| {
-        eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
-        exit(1);
-    });
+    let spawn = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(&argv).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        cmd.spawn()
+    };
+    // Windows reality: npm/gcloud/gh ship .cmd/.bat shims, and neither
+    // Windows nor Rust's PATH search appends those extensions for a bare
+    // name (only .exe). A NotFound retry with the shim extensions makes
+    // every real-world Windows install work — and lets the tests use the
+    // same shims.
+    let mut child = match spawn(tool) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            let retried = [".cmd", ".bat"].iter().find_map(|ext| spawn(&format!("{tool}{ext}")).ok());
+            #[cfg(not(windows))]
+            let retried: Option<Child> = None;
+            let Some(child) = retried else {
+                eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
+                exit(1);
+            };
+            child
+        }
+        Err(e) => {
+            eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
+            exit(1);
+        }
+    };
     let stdout: ChildStdout = child.stdout.take().expect("child stdout");
     (stdout, child)
 }
@@ -47,6 +67,67 @@ pub(crate) fn kill_fetcher(child: &mut Child) {
     #[cfg(unix)]
     let _ = Command::new("kill").arg("-9").arg(format!("-{pid}")).status();
     let _ = child.kill();
+}
+
+/// --timeout watchdog: after `secs` of the child still being alive, kill
+/// the process group and say so. secs == 0 disables (explicit --timeout 0).
+/// Default policy (main's): STREAMING fetchers only (gcloud/k8s) — a bq
+/// job sits silent until done, so a wall-clock there kills legit long
+/// scans; bq needs an explicit --timeout.
+pub(crate) fn spawn_watchdog(child: &std::sync::Arc<std::sync::Mutex<Child>>, secs: u64) {
+    if secs == 0 {
+        return;
+    }
+    let watchdog = std::sync::Arc::clone(child);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        let Ok(mut c) = watchdog.lock() else { return };
+        match c.try_wait() {
+            // reaped or gone: nothing to kill (kill on a reaped pid could
+            // hit an unrelated process)
+            Ok(Some(_)) | Err(_) => {}
+            Ok(None) => {
+                kill_fetcher(&mut c);
+                eprintln!("Error: fetcher killed after --timeout {}s (its job id is visible in the output above).", secs);
+            }
+        }
+    });
+}
+
+/// Reap the fetcher after the run: kill on our own early cut, then poll
+/// try_wait without ever holding the mutex across a sleep (the watchdog
+/// needs the lock; a guard held across the poll-sleep deadlocks it).
+/// Failures of the child itself propagate as Fail::Fetch.
+pub(crate) fn collect_fetcher(
+    child: &std::sync::Arc<std::sync::Mutex<Child>>,
+    tool: Option<&'static str>,
+    early_cut: bool,
+) -> Result<(), crate::errors::Fail> {
+    if early_cut {
+        let mut g = child.lock().unwrap();
+        kill_fetcher(&mut g);
+    }
+    let status;
+    loop {
+        let probed = { child.lock().unwrap().try_wait() };
+        match probed {
+            Ok(Some(s)) => { status = Some(s); break; }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                eprintln!("Warning: failed to wait for {}: {}", tool.unwrap_or("fetcher"), e);
+                status = None;
+                break;
+            }
+        }
+    }
+    let Some(status) = status else { return Ok(()) };
+    if !status.success() && !early_cut {
+        // Propagate: scripts piping cardio must see fetch failures.
+        // (An early-cut kill is OUR failure, already reported — ignore it.)
+        return Err(crate::errors::Fail::Fetch(format!(
+            "{} exited with {}", tool.unwrap_or("fetcher"), status)));
+    }
+    Ok(())
 }
 
 /// Spawn gcloud / bq / open file / stdin. Returns the input source and any
@@ -135,6 +216,31 @@ pub(crate) fn make_reader(
             eprintln!("Note: bq columns: {}", h.iter().collect::<Vec<_>>().join(" | "));
         }
         (Source::Rows(rows), Some(("bq", child)))
+    } else if let Some(selector) = &args.k8s {
+        // kubectl logs selector (pod/name, deployment/name, bare name);
+        // the namespace and context are kubectl's own (current ones).
+        // The agent's most expensive mistake is still an unbounded stream.
+        if since_valid.is_none() {
+            eprintln!("Warning: no --since — this kubectl logs call streams from pod creation. Add --since unless you want everything.");
+        }
+        let mut k8s_args: Vec<String> = vec!["logs".into(), selector.clone()];
+        // --timestamps is REQUIRED for the local --until to exist: without
+        // it kubectl emits ts-less lines and the range filter bypasses
+        // timestamp-less lines entirely (silent no-op, review-caught)
+        k8s_args.push("--timestamps".into());
+        if let Some(c) = &args.k8s_container {
+            k8s_args.push("-c".into());
+            k8s_args.push(c.clone());
+        }
+        // since pushdown: kubectl wants RFC3339 — canonical without frac,
+        // UTC 'Z' appended (the tz-naive caveat is the same as gcloud's).
+        // ponytail: pushdown is the ONLY reason --k8s exists — the trim
+        // engine works through a plain kubectl pipe without it.
+        if let Some(s) = since_valid {
+            k8s_args.push(format!("--since-time={}Z", server_ts(s)));
+        }
+        let (stdout, child) = spawn_fetcher("kubectl", k8s_args);
+        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("kubectl", child)))
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {
             eprintln!("Error opening file {}: {}", path, e);

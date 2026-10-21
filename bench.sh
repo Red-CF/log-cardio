@@ -44,13 +44,21 @@ printf '%-28s %s\n' "MODE" "TIME"
 printf '%-28s %s\n' "---" "----"
 
 if command -v hyperfine >/dev/null; then
-    hyperfine --warmup 1 --min-runs 3 --style=none \
+    # -N = default shell (no user sh rc); style basic = the standard table
+    # BENCH_JSON=path: machine-readable results (the CI bench badge reads it)
+    # export path rides as a real positional arg (quoted, no word-split)
+    if [ -n "${BENCH_JSON:-}" ]; then
+        set -- --export-json "$BENCH_JSON" "$@"
+    fi
+    set -- \
         "/bin/cat $LOG" \
         "$BIN $LOG" \
         "$BIN $LOG --raw" \
         "$BIN $LOG --stats" \
         "$BIN $LOG --query ERROR" \
-        "$BIN $LOG --trace 'sid=([0-9]+)'" 2>&1 | grep -vE '^\s*$'
+        "$BIN $LOG --raw --trace 'sid=([0-9]+)'" \
+        "$@"
+    hyperfine --warmup 1 --min-runs 3 --style basic -N "$@" || true
 else
     echo "hyperfine not installed (brew install hyperfine better) — plain timing:"
     for spec in \

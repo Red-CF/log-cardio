@@ -1,8 +1,9 @@
+
 [package]
 name = "log-cardio"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2024"
-description = "Trim the fat from logs for LLM agents: lean default pipeline (trim + dedup + cap), direct gcloud/bq streaming, trace grouping and surveys — GBs in, tokens out."
+description = "Trim the fat from logs for LLM agents: lean pipeline (trim + dedup + window), direct gcloud/bq/kubectl streaming with cost guards, trace grouping, token-aware surveys, and an MCP stdio server (--mcp)."
 license = "MIT"
 repository = "https://github.com/Red-CF/log-cardio"
 
@@ -20,3 +21,6 @@ regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.6"
+
+[profile.release]
+lto = "thin"
