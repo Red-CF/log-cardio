@@ -251,7 +251,7 @@ out: same engine, structured tools.
 `./bench.sh` builds the release binary and times every mode on a
 synthetic 1M-line log (50% duplicate lines, digit ids, huge XML
 bodies). It uses hyperfine when installed and falls back to a plain
-monotonic-clock loop. First run (M1, release build):
+monotonic-clock loop. Local snapshot (M1, release build):
 
 | mode | time per 1M lines |
 |---|---|
@@ -264,9 +264,9 @@ monotonic-clock loop. First run (M1, release build):
 
 The badge at the top shows the LIVE lean number, measured by CI on
 github's ubuntu runners after every release (and on demand via
-workflow_dispatch) — full per-mode tables at the badge's link. Numbers
-on other hardware: `./bench.sh` and read your own table. The snapshot
-below was one local M1 run for orientation.
+workflow_dispatch) — full per-mode tables at the badge's link. The
+table above is one local M1 run for orientation; on other hardware,
+run `./bench.sh` and read your own.
 
 That is roughly 75 MB/s on the lean path end to end (the 1000-char
 field cutoff included, byte-length fast path). The trim runs as a
