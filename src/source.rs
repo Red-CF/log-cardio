@@ -23,16 +23,36 @@ pub(crate) enum Source {
 /// orphan died of old age (a 30 s "hung" run was exactly this).
 /// Returns (raw stdout pipe, child we own for wait/kill).
 pub(crate) fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdout, Child) {
-    let mut cmd = Command::new(tool);
-    cmd.args(&argv)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = cmd.spawn().unwrap_or_else(|e| {
-        eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
-        exit(1);
-    });
+    let spawn = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(&argv).stdout(Stdio::piped()).stderr(Stdio::inherit());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        cmd.spawn()
+    };
+    // Windows reality: npm/gcloud/gh ship .cmd/.bat shims, and neither
+    // Windows nor Rust's PATH search appends those extensions for a bare
+    // name (only .exe). A NotFound retry with the shim extensions makes
+    // every real-world Windows install work — and lets the tests use the
+    // same shims.
+    let mut child = match spawn(tool) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(windows)]
+            let retried = [".cmd", ".bat"].iter().find_map(|ext| spawn(&format!("{tool}{ext}")).ok());
+            #[cfg(not(windows))]
+            let retried: Option<Child> = None;
+            let Some(child) = retried else {
+                eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
+                exit(1);
+            };
+            child
+        }
+        Err(e) => {
+            eprintln!("Failed to execute {}: {}. Is the {} CLI installed?", tool, e, tool);
+            exit(1);
+        }
+    };
     let stdout: ChildStdout = child.stdout.take().expect("child stdout");
     (stdout, child)
 }
