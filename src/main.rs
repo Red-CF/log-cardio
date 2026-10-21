@@ -4,6 +4,7 @@
 //! the layer it affects.
 
 mod agent_md;
+mod mcp;
 mod pipeline;
 mod sessions;
 mod source;
@@ -133,6 +134,11 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) raw: bool,
 
+    /// Run as an MCP stdio server exposing this binary as agent tools
+    /// (the CLI stays the single contract; same release = no flag skew)
+    #[arg(long)]
+    pub(crate) mcp: bool,
+
     /// Print an agent-facing markdown card (what cardio is, flags, output,
     /// time gotchas) and exit — pipe it: `cardio --agent-md > AGENTS.md`
     #[arg(long)]
@@ -196,6 +202,13 @@ fn main() {
     // can never drift from the binary's real flags.
     if args.agent_md {
         print!("{}", agent_md::AGENT_MD);
+        exit(0);
+    }
+
+    // MCP stdio server mode: this binary as agent tools (line protocol).
+    // stdout becomes the JSON-RPC channel, so nothing else may write it.
+    if args.mcp {
+        mcp::serve();
         exit(0);
     }
 
