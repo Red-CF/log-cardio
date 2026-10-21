@@ -218,7 +218,23 @@ cardio cache.txt --query NTS    # local re-queries cost no fetch
 | `--mcp` | Run as an MCP stdio server exposing these modes as tools (below). |
 | `--agent-md` | Print the agent-facing markdown card (pipe it: `cardio --agent-md > AGENTS.md`). |
 
-## MCP server
+## MCP server and when to use it over the card
+
+Two channels, one engine. The CARD (via `--agent-md` or the AGENTS.md you
+dropped in your repo) teaches an agent that drives cardio through SHELL.
+The MCP server lets an agent runtime that speaks MCP skip that reading
+entirely: tools arrive through `tools/list` with the contract written
+into each schema (what the lean pipeline drops, that the window follows
+the source, that a wide bq scan should dry-run first). So:
+
+- **Shell + card**: best when the agent composes freely (pipes, follow-up
+  greps, `cache.txt` flows). One card read amortizes over a whole repo.
+- **MCP**: best for runtimes where structured tools beat prose — schemas
+  are always current because they ship with the binary itself (a shell
+  can drift if you skip re-reading the card; the MCP tools cannot, since
+  they are the same release).
+- Both channels are honest the same way: what got dropped, field maps,
+  job ids and caps arrive as explicit content, never silent.
 
 `cardio --mcp` speaks MCP (Model Context Protocol) over stdio: line-based
 JSON-RPC with tools/list and tools/call. Same binary, so the tools always
