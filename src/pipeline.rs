@@ -267,8 +267,10 @@ fn clamp_one(field: &str, n: usize) -> String {
 ///   expressed the ordering and the window they wanted — discarding the
 ///   head of an explicitly ordered result is the surprise a real agent
 ///   run reported); reading STOPS at the cap and the fetcher is killed
+///
 /// Explicit --head/--tail override; --skip drops the first N of the kept
 /// stream before the window (that is how bq pages: --skip 100 --head 100).
+///
 /// Returns (dedup inserts, dropped-suspect-duplicates, tail-window-overflow).
 pub(crate) fn run_stream(
     proc: &mut Pipeline,

@@ -94,7 +94,7 @@ fn dispatch(method: &str, params: Option<Value>, id: Value) -> Option<Value> {
                     Some(json!({"jsonrpc": "2.0", "id": id, "result": tool_result(&stdout, &stderr, code != 0)}))
                 }
                 Err(e) => {
-                    Some(json!({"jsonrpc": "2.0", "id": id, "result": tool_result("", &format!("{e}"), true)}))
+                    Some(json!({"jsonrpc": "2.0", "id": id, "result": tool_result("", &e.to_string(), true)}))
                 }
             }
         }
