@@ -535,7 +535,7 @@ fn agent_md_prints_card() {
 
 #[test]
 fn default_pipeline_dedups_and_caps_raw_skips_it() {
-    // lean is the default: dedup on + --max-lines 2000 (overridable);
+    // lean is the default: dedup on + a 2000-line window (overridable);
     // --raw = no dedup, no cap. Repeats must collapse and the cap must
     // apply without any flag
     let mut content = String::new();
@@ -554,7 +554,7 @@ fn default_pipeline_dedups_and_caps_raw_skips_it() {
     let count = out.matches("repeated start").count();
     assert_eq!(count, 0, "head of the range must leave the window, got {count}");
     assert!(out.contains("unique-2099") && !out.contains("unique-0099"), "cap 2000 must keep the most recent");
-    // explicit --max-lines overrides the default cap (same tail semantics)
+    // an explicit --tail overrides the same way
     let capped = cardio(&["--tail", "5", &p]);
     assert_eq!(capped.lines().count(), 5, "got {}", capped.lines().count());
     assert!(capped.contains("unique-2099"), "explicit cap keeps the latest: {capped:?}");

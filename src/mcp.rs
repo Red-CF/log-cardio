@@ -30,19 +30,17 @@ fn cardio_path() -> String {
 
 /// Run cardio with the args the tool call built. stdout = the trimmed
 /// stream; stderr = cardio's honest notes — both go back to the agent.
-fn run_cardio(args: &[String]) -> (String, String, i32) {
+/// Spawn failures surface as a tool error, never kill the server.
+fn run_cardio(args: &[String]) -> Result<(String, String, i32), String> {
     let out = Command::new(cardio_path())
         .args(args)
         .output()
-        .unwrap_or_else(|e| {
-            eprintln!("cardio-mcp: cannot run cardio: {e}");
-            std::process::exit(1);
-        });
-    (
+        .map_err(|e| format!("cannot run cardio ({}): {e} — is it installed and on PATH?", cardio_path()))?;
+    Ok((
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code().unwrap_or(1),
-    )
+    ))
 }
 
 /// MCP tools/call result: each block is free-form text; empty stdout with
@@ -128,10 +126,26 @@ pub(crate) fn serve() {
         };
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        if method.is_empty() {
+            // a bare response/error object (id, no method): answer as the
+            // spec's "invalid request", or stay silent when there is no id
+            // at all to address
+            if !id.is_null() {
+                let bad = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": "invalid request (no method)"}});
+                if writeln!(out, "{bad}").is_err() { break; }
+                out.flush().ok();
+            }
+            continue;
+        }
         match dispatch(method, msg.get("params").cloned(), id) {
             Some(resp) => {
-                writeln!(out, "{resp}").expect("stdout write");
-                out.flush().expect("stdout flush");
+                // client gone (killed, disconnected): quiet exit, not a panic
+                if writeln!(out, "{resp}").is_err() {
+                    break;
+                }
+                if out.flush().is_err() {
+                    break;
+                }
             }
             None => continue,
         }

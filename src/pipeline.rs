@@ -21,19 +21,22 @@ pub(crate) const DEDUP_EXACT_CAP: usize = 5000;
 pub(crate) struct DedupState {
     exact: HashSet<String>,
     bloom: Option<Bloom<String>>,
-    /// bloom insertions, for the saturation warning
-    pub(crate) bloom_insertions: usize,
 }
 
 impl DedupState {
     pub(crate) fn new() -> Self {
-        Self { exact: HashSet::new(), bloom: None, bloom_insertions: 0 }
+        Self { exact: HashSet::new(), bloom: None }
     }
 
     /// true = unique (keep); false = duplicate-suspect (drop)
     fn check_and_set(&mut self, line: &str) -> bool {
         if self.exact.len() < DEDUP_EXACT_CAP {
             return self.exact.insert(line.to_string());
+        }
+        // The exact set stays consulted forever: a line seen in the first
+        // 5000 keeps colliding after the switch, whatever the bloom thinks.
+        if self.exact.contains(line) {
+            return false;
         }
         if self.bloom.is_none() {
             self.bloom = Some(Bloom::new_for_fp_rate(10_000_000, 0.01)
@@ -43,9 +46,6 @@ impl DedupState {
         // single probe: check + insert in one hash pass
         let owned = line.to_string();
         let seen = self.bloom.as_mut().unwrap().check_and_set(&owned);
-        if !seen {
-            self.bloom_insertions += 1;
-        }
         !seen
     }
 }
@@ -251,11 +251,22 @@ impl Pipeline {
 /// alloc only for the copy — acceptable at the return site (the trimmed
 /// path already allocates).
 fn clamp_one(field: &str, n: usize) -> String {
-    if field.chars().count() <= n {
+    // bytes >= chars in UTF-8: a short byte length proves short chars —
+    // the common case (ASCII-ish log lines) costs no scan at all
+    if field.len() <= n {
         return field.to_string();
     }
-    let mut out: String = field.chars().take(n).collect();
-    out.push('…');
+    let mut out = String::with_capacity(n + 1);
+    for (i, c) in field.chars().enumerate() {
+        if i == n {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+    }
+    // multi-byte long field with <= n chars: nothing to cut
+    out.clear();
+    out.push_str(field);
     out
 }
 
@@ -280,16 +291,9 @@ pub(crate) fn run_stream(
 ) -> (usize, usize, bool) {
     let mut dedup_inserts = 0usize;
     let mut dropped_dups = 0usize;
-    let fetcher = proc.child_tool.is_some();
-    // window side + n: raw without a flag = unbounded (no window)
-    let (head_n, tail_n): (Option<usize>, Option<usize>) = if args.head.is_some() || args.tail.is_some() {
-        (args.head, args.tail)
-    } else if !args.raw {
-        // lean default window: fetchers keep the head, streams the tail
-        if fetcher { (Some(crate::LEAN_MAX_LINES), None) } else { (None, Some(crate::LEAN_MAX_LINES)) }
-    } else {
-        (None, None)
-    };
+    // window side + n decided in main (where the source is known) and
+    // passed through args.head/tail: raw without a flag = unbounded
+    let (head_n, tail_n): (Option<usize>, Option<usize>) = (args.head, args.tail);
     let mut skip = args.skip.unwrap_or(0);
     let mut head_kept = 0usize;
     let mut dedup_state = DedupState::new();

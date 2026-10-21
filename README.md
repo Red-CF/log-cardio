@@ -254,14 +254,15 @@ monotonic-clock loop. First run (M1, release build):
 
 | mode | time per 1M lines |
 |---|---|
-| `cat` baseline | 0.02 s |
-| `--query` | 0.12 s |
-| `--raw` (no pipeline) | 0.20 s |
-| `--trace` (raw, uncapped) | 0.38 s |
-| lean (default: trim + dedup + cap) | 0.51 s |
-| `--stats` | 0.65 s |
+| `cat` baseline | 0.01 s |
+| `--query` | 0.11 s |
+| `--raw` (no pipeline) | 0.21 s |
+| `--trace` (raw, uncapped) | 0.39 s |
+| `--stats` | 0.68 s |
+| lean (trim + exact dedup + window + field cut) | 0.62 s |
 
-That is roughly 65 MB/s on the lean path end to end. The trim runs as a
+That is roughly 75 MB/s on the lean path end to end (the 1000-char
+field cutoff included, byte-length fast path). The trim runs as a
 single combined regex pass. When the input comes from gcloud or bq, the
 network dominates anyway. The bench's trace scenario runs with `--raw`
 on purpose: in lean mode the session cap bounds the input early, so its
@@ -270,7 +271,7 @@ time would measure the cap rather than the grouper.
 ## Tests
 
 ```bash
-cargo test    # 61 CLI integration (tests/cli.rs) + unit (src/timestamps.rs)
+cargo test    # 63 integration: tests/cli.rs + tests/mcp.rs, and 1 unit (src/timestamps.rs)
 ```
 
 Philosophy: black-box, at the CLI level. Tests pin the promises the

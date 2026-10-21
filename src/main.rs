@@ -51,6 +51,11 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) tail: Option<usize>,
 
+    /// Deprecated since 1.0.0: the tail window is --tail; a trace-mode
+    /// event cap is --head. Hidden from help; a note says where it moved
+    #[arg(long, hide = true)]
+    pub(crate) max_lines: Option<usize>,
+
     /// Keep only the FIRST N kept lines — the lean default for cloud
     /// fetchers (the query's own ordering is user intent); in
     /// --trace/--summary mode this is the event cap per run
@@ -238,6 +243,19 @@ fn main() {
     // explicit --head/--tail wins --raw notwithstanding: asking for a
     // cap is asking for a cap.
     let mut args = args;
+    // --max-lines moved in 1.0.0: window role -> --tail, trace-role -> --head.
+    // Hidden deprecation alias so existing scripts get one release of hints.
+    if let Some(n) = args.max_lines {
+        if args.tail.is_none() {
+            args.tail = Some(n);
+        }
+        eprintln!("Note: --max-lines is deprecated since 1.0.0 — use --tail for the window, --head for a trace-mode event cap.");
+    }
+    args.max_lines = None;
+    // explicitness before the window policy fills defaults in below:
+    // the stderr notes only narrate DROPS the caller did not ask for
+    let explicit_tail = args.tail.is_some();
+    let explicit_head = args.head.is_some();
     let dedup = args.dedup || !args.raw;
     if !args.raw {
         args.max_field_len = args.max_field_len.or(Some(FIELD_LEN_DEFAULT));
@@ -369,6 +387,16 @@ fn main() {
 
     let (reader, fetched_child) = make_reader(&args, &since_valid, &until_valid);
     let child_tool = fetched_child.as_ref().map(|(t, _)| *t);
+    // THE window policy, next to the source decision that drives it: lean
+    // (no explicit flag, no --raw) caps at LEAN_MAX_LINES — fetchers keep
+    // the HEAD (their query's ordering is the caller's intent), streams
+    // keep the TAIL (recent beats old). trace-mode event caps share --head.
+    if matches!(run, Run::Stream | Run::Sessions)
+        && args.head.is_none() && args.tail.is_none()
+        && !args.raw && !args.stats {
+            if child_tool.is_some() { args.head = Some(LEAN_MAX_LINES); }
+            else { args.tail = Some(LEAN_MAX_LINES); }
+    }
     // Shared with the watchdog thread: main blocks on reads (not on the
     // mutex), so the watchdog can lock freely and kill a hung child.
     let child = fetched_child.map(|(_, c)| std::sync::Arc::new(std::sync::Mutex::new(c)));
@@ -478,7 +506,7 @@ fn main() {
             if result.dropped_dups == 1 { "" } else { "s" }
         );
     }
-    if result.window_full && args.tail.is_none() {
+    if result.window_full && !explicit_tail {
         eprintln!(
             "Note: kept the last {} lines — the most recent; the rest of the input was read and trimmed (--raw removes the cap; --query TEXT narrows before reading).",
             LEAN_MAX_LINES
@@ -486,8 +514,9 @@ fn main() {
     }
     if early_cut {
         eprintln!(
-            "Note: output stopped at the head cap ({} lines) — the head is kept, the rest was not read (--raw removes the cap; --query narrows).",
-            args.head.unwrap_or(LEAN_MAX_LINES)
+            "Note: output stopped at the head cap ({} lines); the rest of the input was not read.{}",
+            args.head.unwrap_or(LEAN_MAX_LINES),
+            if explicit_head { "" } else { " (the lean default; --raw removes it)" }
         );
     }
     if result.dedup_inserts > 10_000_000 {
@@ -553,7 +582,7 @@ fn main() {
     }
     flush(&mut outbuf);
 
-    // We cut the stream early (--max-lines / --timeout): kill the fetcher
+    // We cut the stream early (--head window / --timeout): kill the fetcher
     // outright. Rust ignores SIGPIPE and children inherit it, so gcloud
     // would die on EPIPE with a nonzero exit — reported as a failure we
     // caused.
