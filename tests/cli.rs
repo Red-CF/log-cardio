@@ -267,7 +267,7 @@ fn bq_lone_cr_content_is_preserved() {
 #[cfg(unix)]
 fn fake_bq(csv: &str, args: &[&str]) -> String {
     let body = format!("#!/bin/sh\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n");
-    let out = run_with_fake("bq", &body, args);
+    let out = run_with_fake("bq", body.as_str(), args);
     assert!(
         out.status.success(),
         "cardio exited {}: stderr: {:?}",
@@ -730,7 +730,7 @@ fn fake_bq_argv(csv: &str, args: &[&str]) -> (String, String) {
     let body = format!(
         "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\" >&2; done\ncat <<'CARDIO_CSV'\n{csv}\nCARDIO_CSV\n"
     );
-    let out = run_with_fake("bq", &body, args);
+    let out = run_with_fake("bq", body.as_str(), args);
     assert!(
         out.status.success(),
         "cardio exited {}: stderr: {:?}",
@@ -1278,13 +1278,15 @@ fn group_col_counts_bq_columns() {
     );
     assert!(out.contains("mon|ok"), "multi-col key: {out:?}");
 
-    // unknown column = usage error before any output
-    let bad = Command::new(env!("CARGO_BIN_EXE_cardio"))
-        .args(["--bq", "SELECT 1", "--group-col", "nope"])
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .output()
-        .expect("cardio run");
-    assert!(!bad.status.success());
-    let e = String::from_utf8_lossy(&bad.stderr);
+    // unknown column = usage error BEFORE anything real (exit 2), run
+    // through a non-asserting fake: the header comes from the stub CSV
+    let body = "#!/bin/sh\ncat <<'CSV'\nts,day,status\n2026-10-09T12:00:00,mon,ok\nCSV\n";
+    let out = run_with_fake(
+        "bq", body,
+        &["--bq", "SELECT 1", "--group-col", "nope"],
+    );
+    assert!(!out.status.success(), "exit 2 on unknown column");
+    assert_eq!(out.status.code(), Some(2), "usage error: {:?}", out.status.code());
+    let e = String::from_utf8_lossy(&out.stderr);
     assert!(e.contains("nope") && e.contains("not in the bq header"), "{e:?}");
 }
