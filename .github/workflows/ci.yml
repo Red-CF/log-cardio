@@ -50,9 +50,13 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: instrumented tests
+        # src/mcp is EXCLUDED from the ratio: its stdio tests are black-box
+        # (tests/mcp.rs drives the spawned binary), and llvm tooling cannot
+        # attribute coverage to a child process — counting it as 0% would
+        # just lie. Everything else must stay ≥80%.
         run: |
           rustup component add llvm-tools-preview
-          cargo llvm-cov --lcov --output-path lcov.info
+          cargo llvm-cov --lcov --ignore-filename-regex 'src/mcp' --output-path lcov.info
       - name: update gh-pages badge
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:

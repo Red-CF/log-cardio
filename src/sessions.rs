@@ -15,6 +15,8 @@ pub(crate) const MAX_LINES_PER_SESSION: usize = 1_000;
 pub(crate) enum Run {
     /// survey: pattern frequencies to stderr, no stream output
     Stats,
+    /// census: count rows per --group-col value(s) (bq tab rows)
+    Group { cols: Vec<usize> },
     /// group by ID: full sessions or the compact --summary map
     Sessions,
     /// plain one-line-per-event stream

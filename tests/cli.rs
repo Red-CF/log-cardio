@@ -1188,3 +1188,103 @@ fn k8s_until_binds_locally_and_lines_carry_timestamps() {
     assert!(err.contains("--timestamps"), "ts line format on for local bounds: {err:?}");
     assert!(err.contains("--since-time=2026-10-19T00:00:00Z"), "since pushdown intact: {err:?}");
 }
+
+#[test]
+fn dedup_fold_collapses_digit_only_differences() {
+    let path = fixture(
+        "2026-10-09T12:00:00 op sid=111 ok\n\
+         2026-10-09T12:00:01 op sid=222 ok\n\
+         2026-10-09T12:00:02 op distinct event\n\
+         2026-10-09T12:00:03 op sid=999 ok\n",
+    );
+    let p = path.0.to_string_lossy().into_owned();
+    // plain lean: the three "ok" lines are distinct (exact dedup)
+    let out = cardio(&[&p]);
+    assert_eq!(out.matches("op sid").count(), 3, "exact keeps all: {out:?}");
+    // fold level: digit-only variants collapse to one
+    let (folded, err) = cardio_out(&[&p, "--dedup-fold"]);
+    assert_eq!(folded.matches("op sid").count(), 1, "fold collapses: {folded:?}");
+    assert!(folded.contains("op distinct"), "different content stays: {folded:?}");
+    assert!(err.contains("fold-dedup collapsed"), "fold announced: {err:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cardio_max_bytes_env_guard() {
+    // 100GB binary = 107374182400 bytes billed cap pushed for the agent
+    let (_, err) = fake_bq_argv("timestamp,text\nt1,hello\n", &["--bq", "SELECT 1"]);
+    let _ = err;
+    // NOTE: env is read inside cardio — set it through Command via a hand-rolled run
+    use std::os::unix::fs::PermissionsExt as _;
+    let fake = std::env::temp_dir().join(format!("cardio_envbq_{}", FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::create_dir_all(&fake).expect("mkdir");
+    let script = fake.join("bq");
+    std::fs::write(&script, "#!/bin/sh\necho ARG:$* >&2\ntrue\n").expect("write");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT 1"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("CARDIO_MAX_BYTES", "100GB")
+        .output()
+        .expect("cardio run");
+    assert!(out.status.success(), "stderr: {:?}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--maximum_bytes_billed=107374182400"), "env guard pushed: {stderr:?}");
+
+    // explicit flag wins over the env
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT 1", "--max-bytes-billed", "5"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("CARDIO_MAX_BYTES", "100GB")
+        .output()
+        .expect("cardio run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--maximum_bytes_billed=5"), "explicit flag wins: {stderr:?}");
+    assert!(!stderr.contains("--maximum_bytes_billed=107374182400"), "env suppressed: {stderr:?}");
+
+    // 0 disables
+    let out = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT 1"])
+        .env("PATH", format!("{}:{}", fake.display(), std::env::var("PATH").unwrap_or_default()))
+        .env("CARDIO_MAX_BYTES", "0")
+        .output()
+        .expect("cardio run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("maximum_bytes_billed"), "0 disables: {stderr:?}");
+    std::fs::remove_dir_all(&fake).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn group_col_counts_bq_columns() {
+    // census: count rows per status column (verbatim rows keep the header
+    // map stable); NDJSON reuses the stats shape
+    let (out, err) = fake_bq_argv(
+        "ts,day,status\n\
+         2026-10-09T12:00:00,mon,ok\n\
+         2026-10-09T13:00:00,mon,ok\n\
+         2026-10-09T14:00:00,tue,fail\n",
+        &["--bq", "SELECT 1", "--group-col", "status", "--json"],
+    );
+    assert!(out.contains("\"pattern\":\"ok\"") && out.contains("\"count\":2"), "ok group: {out:?}");
+    assert!(out.contains("\"pattern\":\"fail\"") && out.contains("\"count\":1"), "fail group: {out:?}");
+    assert!(!out.contains("2026-10-09"), "census emits counts, not rows: {out:?}");
+    let _ = err;
+
+    // multi-column: joined with '|'
+    let (out, _) = fake_bq_argv(
+        "ts,day,status\n2026-10-09T12:00:00,mon,ok\n2026-10-09T13:00:00,tue,fail\n",
+        &["--bq", "SELECT 1", "--group-col", "day,status", "--json"],
+    );
+    assert!(out.contains("mon|ok"), "multi-col key: {out:?}");
+
+    // unknown column = usage error before any output
+    let bad = Command::new(env!("CARGO_BIN_EXE_cardio"))
+        .args(["--bq", "SELECT 1", "--group-col", "nope"])
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .output()
+        .expect("cardio run");
+    assert!(!bad.status.success());
+    let e = String::from_utf8_lossy(&bad.stderr);
+    assert!(e.contains("nope") && e.contains("not in the bq header"), "{e:?}");
+}

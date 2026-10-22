@@ -79,6 +79,8 @@ would sit). Pass value-flags first when unsure.
 | `--top N` | trace mode (full or summary): keep only the biggest N sessions, the rest drop with a note |
 | `--max-field-len N` | cut huge fields or lines (XML/JWT bodies) after N chars with a "…" marker (lean default 1000; 0 = unlimited) |
 | `--stats` | survey mode: top-pattern frequencies, no stream output. Digit runs fold to #, so per-id noise groups |
+| `--dedup-fold` | a dedup level for censuses: lines differing only in digit runs collapse (folds digits to # like --stats); the run notes say it |
+| `--group-col day,status` | bq census: count rows per column value, printed like --stats (NDJSON with --json). Rows go verbatim; only with --bq |
 | `--stats --json` | same survey as NDJSON on stdout: {"pattern","count"} |
 | `--dedup` | with --raw: drop repeated lines after all (lean mode has dedup on by default) |
 | `--gcloud FILTER` | stream Cloud Logging (--since/--until pushed server-side) |
@@ -118,7 +120,10 @@ against UTC bounds.
 - A line whose timestamp does not match the (configurable) timestamp
   grammar (e.g. a bare date with no time) bypasses the range filter and
   is printed as-is; there is no warning for it today.
-- `--bq` mode: column names print once to stderr ("Note: bq columns: …");
+- `--bq` mode: a cost guard can live in the ENV (CARDIO_MAX_BYTES=100GB)
+  so wide scans error instead of running wide on autopilot; 0 disables,
+  the explicit --max-bytes-billed flag always wins. Column names print
+  once to stderr ("Note: bq columns: …");
   row fields join with a TAB, so empty columns keep their separator.
   bq status chatter is suppressed. Cost guards: `--dry-run` estimates,
   `--max-bytes-billed` caps, `--project` selects the exec project.

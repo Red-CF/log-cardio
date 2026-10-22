@@ -9,6 +9,7 @@ use crate::sessions::RunResult;
 
 /// Run facts the notes need; filled in main after the runners return.
 pub(crate) struct Notes {
+    pub dedup_fold: bool,
     pub explicit_tail: bool,
     pub explicit_head: bool,
     /// the effective head cap, for the early-cut note
@@ -31,11 +32,18 @@ pub(crate) fn emit(
     // agent (or the person reading the log) must SEE exactly what was
     // given up — never silently.
     if result.dropped_dups > 0 {
-        eprintln!(
-            "Note: dedup dropped {} repeat line{}. Under the 5000-unique-lines mark dedup is exact; above it, a few may actually be unique (--raw keeps everything).",
-            result.dropped_dups,
-            if result.dropped_dups == 1 { "" } else { "s" }
-        );
+        if n.dedup_fold {
+            eprintln!(
+                "Note: fold-dedup collapsed {} line{} (lines differing only in digit runs count as repeats — by design; --raw or plain --dedup for exactness).",
+                result.dropped_dups, if result.dropped_dups == 1 { "" } else { "s" }
+            );
+        } else {
+            eprintln!(
+                "Note: dedup dropped {} repeat line{}. Under the 5000-unique-lines mark dedup is exact; above it, a few may actually be unique (--raw keeps everything).",
+                result.dropped_dups,
+                if result.dropped_dups == 1 { "" } else { "s" }
+            );
+        }
     }
     if result.window_full && !n.explicit_tail {
         eprintln!(

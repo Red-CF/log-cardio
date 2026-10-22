@@ -8,7 +8,13 @@ use bloomfilter::Bloom;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
+use std::sync::LazyLock;
 use std::io::{self, Write};
+
+/// THE fold used by --stats and --dedup-fold: digit runs become '#', so
+/// "sid=123" and "sid=456" are ONE pattern (three agents hit per-UUID
+/// floods that told them nothing). One source, two consumers.
+pub(crate) static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new("[0-9]+").unwrap());
 
 /// Dedup is exact while the input stays small (zero false positives — the
 /// trust complaint two agent runs had), and probabilistic from the 5000th
@@ -28,14 +34,21 @@ impl DedupState {
         Self { exact: HashSet::new(), bloom: None }
     }
 
-    /// true = unique (keep); false = duplicate-suspect (drop)
-    fn check_and_set(&mut self, line: &str) -> bool {
+    /// true = unique (keep); false = duplicate-suspect (drop). `fold`
+    /// compares digit-run-folded keys (--dedup-fold): near-identical
+    /// rows collapse by design — census mode, announced on stderr.
+    fn check_and_set(&mut self, line: &str, fold: bool) -> bool {
+        let key = if fold {
+            DIGIT_RUN.replace_all(line, "#").into_owned()
+        } else {
+            line.to_string()
+        };
         if self.exact.len() < DEDUP_EXACT_CAP {
-            return self.exact.insert(line.to_string());
+            return self.exact.insert(key);
         }
         // The exact set stays consulted forever: a line seen in the first
         // 5000 keeps colliding after the switch, whatever the bloom thinks.
-        if self.exact.contains(line) {
+        if self.exact.contains(&key) {
             return false;
         }
         if self.bloom.is_none() {
@@ -44,8 +57,7 @@ impl DedupState {
             eprintln!("Note: 5000+ unique lines so far — dedup switched from exact to probabilistic (bloom, ~1% false positives).");
         }
         // single probe: check + insert in one hash pass
-        let owned = line.to_string();
-        let seen = self.bloom.as_mut().unwrap().check_and_set(&owned);
+        let seen = self.bloom.as_mut().unwrap().check_and_set(&key);
         !seen
     }
 }
@@ -314,7 +326,7 @@ pub(crate) fn run_stream(
         if dedup {
             // probe on the UNCLAMPED line: lines sharing their first N
             // chars must not collide as duplicates after --max-field-len
-            if !dedup_state.check_and_set(&line) {
+            if !dedup_state.check_and_set(&line, args.dedup_fold) {
                 dropped_dups += 1;
                 continue;
             }
