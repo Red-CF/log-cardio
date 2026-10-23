@@ -2,15 +2,11 @@
 //! output forms (stderr table, NDJSON). Mode wiring stays in main.
 
 use crate::consts::MAX_STATS_PATTERNS;
+use crate::pipeline::DIGIT_RUN;
 use crate::pipeline::{Pipeline, Sink, emit};
-use regex::Regex;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 
-/// --stats folds digit runs to '#' before counting: "sid=123" and
-/// "sid=456" are ONE pattern to the survey, not two (three agents hit
-/// per-UUID floods that told them nothing). Dedup keeps exact lines.
-static DIGIT_RUN: LazyLock<Regex> = LazyLock::new(|| Regex::new("[0-9]+").unwrap());
+
 
 /// Stats mode: survey the whole file; returns counts + whether capped.
 pub(crate) fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
@@ -35,6 +31,45 @@ pub(crate) fn run_stats(proc: &mut Pipeline) -> (HashMap<String, usize>, bool) {
             *c += 1;
         } else if stats_map.len() < MAX_STATS_PATTERNS {
             stats_map.insert(key.to_string(), 1);
+        } else {
+            capped = true;
+        }
+    }
+    (stats_map, capped)
+}
+
+/// Census mode: count KEPT rows per selected column value (rows are the
+/// verbatim tab-joined bq fields). Same caps and tie order as the survey:
+/// it IS the survey over one fold, so both forms print the same way and
+/// the agent needs no new mental model.
+pub(crate) fn run_group(
+    proc: &mut Pipeline,
+    cols: &[usize],
+) -> (HashMap<String, usize>, bool) {
+    let mut stats_map: HashMap<String, usize> = HashMap::new();
+    let mut capped = false;
+    while let Some((_, line)) = proc.next_trimmed() {
+        let key: String = if cols.len() == 1 {
+            match line.split('\t').nth(cols[0]) {
+                Some(v) => v.to_string(),
+                None => continue,
+            }
+        } else {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let mut parts = Vec::new();
+            for &c in cols {
+                match fields.get(c) {
+                    Some(v) => parts.push(v.to_string()),
+                    None => { parts.clear(); break; }
+                }
+            }
+            if parts.is_empty() { continue; }
+            parts.join("|")
+        };
+        if let Some(c) = stats_map.get_mut(&key) {
+            *c += 1;
+        } else if stats_map.len() < MAX_STATS_PATTERNS {
+            stats_map.insert(key, 1);
         } else {
             capped = true;
         }

@@ -150,6 +150,11 @@ cardio --bq 'SELECT text, FORMAT_TIMESTAMP("%Y-%m-%dT%H:%M:%SZ", ts) AS timestam
 
 bq tips:
 
+- **A default cost guard can live in the environment**:
+  `CARDIO_MAX_BYTES=100GB` adds `--maximum_bytes_billed` to every bq run
+  (binary units; `0` disables; the explicit `--max-bytes-billed` flag
+  always wins) — a first "let me see what comes out" pass then fails
+  fast instead of scanning 68GB uncontrolled.
 - **The biggest lever is the SQL, not cardio.** SELECT exactly the
   fields you need (for example `jsonPayload.message`), and never pull
   whole payloads with `TO_JSON_STRING(payload)`. A wide SELECT costs
@@ -206,6 +211,8 @@ cardio cache.txt --query NTS    # local re-queries cost no fetch
 | `--summary` | With `--trace`: compact per-ID map with event count plus first and last events. IDs preserved. |
 | `--top N` | In trace mode (full or summary): keep only the biggest N sessions; the rest drop with a note. |
 | `--stats` | Survey mode: top 20 pattern frequencies on stderr, no stream output. Digit runs fold to `#` first, so `sid=123` and `sid=456` count as one pattern. `--stats --json` prints NDJSON `{"pattern","count"}` on stdout. |
+| `--dedup-fold` | Third dedup level for censuses: lines differing only in digit runs collapse (digits become `#`, same fold as `--stats`); the run announces it on stderr. |
+| `--group-col day,status` | bq census: count rows per column value — same output shape as `--stats` (NDJSON with `--json`). Rows are verbatim, so the column map matches the header. Only with `--bq`. |
 | `--gcloud FILTER` | Stream Cloud Logging entries matching this filter. `--since`/`--until` pushed server-side. |
 | `--bq SQL` | Run the bq CLI with this SQL and process its rows. Exactly one source at a time. |
 | `--k8s SELECTOR` | kubectl logs target (`pod/x`, `deployment/x`, bare name); `--since` pushes to `--since-time`. |
@@ -252,7 +259,14 @@ match the flags. Six tools:
 
 Results carry the trimmed lines plus cardio's stderr notes (what was
 dropped, bq column names, job ids) as separate text blocks; a nonzero
-cardio exit comes back as an `isError` result, not a client crash.
+cardio exit comes back as an `isError` result, not a client crash. When
+the client passes a progress token, fetch tools emit progress
+notifications (start + a heartbeat every 10 s) — big bq scans are LEGIT
+slow, and "working" must never look like "hung".
+Both pipes are drained concurrently (a 1.0.0 run hung 30 minutes when
+they were read sequentially); oversized output is capped (8 MiB stdout /
+64 KiB stderr) with an in-band truncation marker — the MCP layer is a
+context window, not a filesystem.
 
 For Claude Code, register it with:
 
@@ -308,6 +322,12 @@ staleness test makes every clap flag appear in the agent card, so the
 card can only go stale by leaving a flag out on purpose. Unit tests
 exist only for pure math that a CLI test cannot probe sanely, such as
 calendar rollovers and the 9999-12-31 clamp.
+
+Coverage (cargo llvm-cov, the `coverage` job): ~89% and held ≥80% by the
+gate of taste, not a hard rule. The MCP layer is measured separately:
+its tests drive the spawned binary over stdio, which llvm tooling cannot
+attribute to source — the layer is excluded from the ratio instead of
+pretending it is untested.
 
 ## Time handling
 

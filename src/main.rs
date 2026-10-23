@@ -39,6 +39,12 @@ pub(crate) struct Args {
     #[arg(long)]
     pub(crate) dedup: bool,
 
+    /// Fold dedup: lines differing only in digit runs count as repeats
+    /// (digits become '#', the same fold as --stats) — a third dedup level
+    /// for censuses ("same operation, different sid" collapses)
+    #[arg(long)]
+    pub(crate) dedup_fold: bool,
+
     /// Keep only the LAST N kept lines — the most recent beat the old
     /// (whole input reads). The lean default for files/stdin
     #[arg(long)]
@@ -141,6 +147,12 @@ pub(crate) struct Args {
     /// "…" marker — huge XML bodies don't need SQL SUBSTR hacks
     #[arg(long)]
     pub(crate) max_field_len: Option<usize>,
+
+    /// bq census: count rows per column value ("--group-col day,status"),
+    /// printed like --stats (NDJSON with --json). Rows are verbatim; only
+    /// with --bq
+    #[arg(long)]
+    pub(crate) group_col: Option<String>,
 
     /// Path to TOML config file (timestamp_regex, boilerplate_regex, default_trace)
     #[arg(long)]
@@ -301,7 +313,7 @@ fn main() {
 
     // Mode precedence: stats is survey (trace/summary ignored); trace/summary
     // need an ID pattern; plain stream otherwise. Dedup applies to stream only.
-    let run = if args.stats {
+    let mut run = if args.stats {
         Run::Stats
     } else if trace_re.is_some() {
         Run::Sessions
@@ -335,8 +347,35 @@ fn main() {
         .map(|u| canonical_bound(u, true));
     let range_filter = since_valid.is_some() || until_valid.is_some();
 
-    let (reader, fetched_child) = make_reader(&args, &since_valid, &until_valid);
+    let (reader, fetched_child, headers) = make_reader(&args, &since_valid, &until_valid);
     let child_tool = fetched_child.as_ref().map(|(t, _)| *t);
+    // --group-col needs the CSV header map: validate the column names NOW
+    // (usage error before any fetch output, not mid-run)
+    let group_cols: Vec<usize> = if let Some(spec) = &args.group_col {
+        let Some(cols) = &headers else {
+            bail(Fail::Source("--group-col only works with --bq (it needs the CSV header row).".into()));
+        };
+        let mut idxs = Vec::new();
+        for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match cols.iter().position(|c| c == name) {
+                Some(i) => idxs.push(i),
+                None => {
+                    bail(Fail::Usage(format!(
+                        "column {name:?} not in the bq header ({})",
+                        cols.join(", ")
+                    )));
+                }
+            }
+        }
+        idxs
+    } else {
+        Vec::new()
+    };
+    if !group_cols.is_empty() {
+        // mode precedence: census overrides stream/trace (stats still wins —
+        // it already warned above; keep that contract)
+        run = Run::Group { cols: group_cols.clone() };
+    }
     // THE window policy, next to the source decision that drives it: lean
     // (no explicit flag, no --raw) caps at LEAN_MAX_LINES — fetchers keep
     // the HEAD (their query's ordering is the caller's intent), streams
@@ -352,7 +391,7 @@ fn main() {
     }
     if matches!(run, Run::Stream | Run::Sessions)
         && args.head.is_none() && args.tail.is_none()
-        && !args.raw && !args.stats {
+        && !args.raw && !args.stats && !matches!(run, Run::Group { .. }) {
             if matches!(run, Run::Sessions) || child_tool.is_some() {
                 // sessions collect events: the cap rides --head (both for
                 // files and fetchers); plain streams: tail for files,
@@ -382,7 +421,7 @@ fn main() {
         query: args.query.clone(),
         range_filter,
         child_tool,
-        verbatim: args.raw,
+        verbatim: args.raw || matches!(run, Run::Group { .. }),
         max_field_len: args.max_field_len,
         since_valid,
         until_valid,
@@ -399,6 +438,19 @@ fn main() {
     let mut outbuf: Sink = io::BufWriter::new(&mut out);
 
     let result = match run {
+        Run::Group { cols } => {
+            let (map, capped) = stats::run_group(&mut proc, &cols);
+            sessions::RunResult {
+                stats_map: Some(map),
+                sessions: None,
+                stats_capped: capped,
+                sessions_capped: false,
+                session_lines_capped: false,
+                dedup_inserts: 0,
+                dropped_dups: 0,
+                window_full: false,
+            }
+        }
         Run::Stats => {
             let (map, capped) = stats::run_stats(&mut proc);
             sessions::RunResult {
@@ -464,6 +516,7 @@ fn main() {
 
     notes::emit(
         &notes::Notes {
+            dedup_fold: args.dedup_fold,
             explicit_tail,
             explicit_head,
             head_size: args.head.unwrap_or(consts::LEAN_MAX_LINES),

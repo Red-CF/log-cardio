@@ -6,7 +6,6 @@
 
 use serde_json::{json, Value};
 use std::sync::LazyLock;
-use super::run_cardio;
 
 pub(crate) static SCHEMA: LazyLock<Vec<Value>> = LazyLock::new(|| vec![
     json!({
@@ -98,7 +97,7 @@ pub(crate) static SCHEMA: LazyLock<Vec<Value>> = LazyLock::new(|| vec![
 
 /// Dispatch a tools/call. Errors here become isError=true results (the
 /// agent sees the reason); cardio's own failures propagate the same way.
-pub(crate) fn execute(name: &str, args: Value) -> Result<(String, String, i32), String> {
+pub(crate) fn execute(name: &str, args: Value) -> Result<Vec<String>, String> {
     let s = |key: &str| args.get(key).and_then(Value::as_str);
     let b = |key: &str| args.get(key).and_then(Value::as_bool);
     let mut argv: Vec<String> = Vec::new();
@@ -185,5 +184,5 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<(String, String, i32), 
         }
         other => return Err(format!("unknown tool: {other}")),
     }
-    run_cardio(&argv)
+    Ok(argv)
 }

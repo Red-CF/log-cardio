@@ -57,6 +57,51 @@ pub(crate) fn spawn_fetcher(tool: &'static str, argv: Vec<String>) -> (ChildStdo
     (stdout, child)
 }
 
+/// The environment cost guard: CARDIO_MAX_BYTES gives bq an
+/// --maximum_bytes_billed the agent never has to remember ("100GB"
+/// style sizes or raw byte counts; CARDIO_MAX_BYTES=0 disables). The
+/// explicit --max-bytes-billed always wins. Unparseable values WARN
+/// and run unlimited — silently running wide was the real-world pain.
+fn builtin_bytes_guard() -> Option<u64> {
+    let spec = std::env::var("CARDIO_MAX_BYTES").ok()?;
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "0" {
+        return None;
+    }
+    match parse_byte_size(spec) {
+        Some(bytes) => Some(bytes),
+        None => {
+            eprintln!("Warning: CARDIO_MAX_BYTES={spec:?} is not a size (use like 100GB or 500MB) - this run is NOT bytes-capped.");
+            None
+        }
+    }
+}
+
+/// "100GB" -> 100 * 2^30 (binary units, what BigQuery bytes-billed uses).
+/// Bare numbers are raw bytes.
+fn parse_byte_size(spec: &str) -> Option<u64> {
+    let (digits, mult) = match spec.chars().last()?.to_ascii_lowercase() {
+        'b' => match spec[..spec.len()-1].trim_end().chars().last()?.to_ascii_lowercase() {
+            'k' => (&spec[..spec.len()-2], 1024u64),
+            'm' => (&spec[..spec.len()-2], 1024u64 * 1024),
+            'g' => (&spec[..spec.len()-2], 1024u64 * 1024 * 1024),
+            't' => (&spec[..spec.len()-2], 1024u64 * 1024 * 1024 * 1024),
+            _ => (spec, 1),
+        },
+        'k' => (&spec[..spec.len()-1], 1024u64),
+        'm' => (&spec[..spec.len()-1], 1024u64 * 1024),
+        'g' => (&spec[..spec.len()-1], 1024u64 * 1024 * 1024),
+        't' => (&spec[..spec.len()-1], 1024u64 * 1024 * 1024 * 1024),
+        d if d.is_ascii_digit() => (spec, 1),
+        _ => return None,
+    };
+    parse_digits(digits)?.checked_mul(mult)
+}
+
+fn parse_digits(s: &str) -> Option<u64> {
+    s.trim().parse::<u64>().ok()
+}
+
 /// Kill a fetcher AND its whole process group when possible (unix): a
 /// plain Child::kill leaves orphaned grandchildren holding the output
 /// pipe. The kill(1) subprocess is dependency-free; the plain kill falls
@@ -136,11 +181,18 @@ pub(crate) fn collect_fetcher(
 /// of entries that local filtering would drop.
 /// ponytail: bq mode can't push bounds — the SQL is the user's — so
 /// --since/--until filter locally; date it in the query itself.
+/// (reader source, spawned fetcher + tool name, bq CSV header columns)
+pub(crate) type ReaderSetup = (
+    Source,
+    Option<(&'static str, Child)>,
+    Option<Vec<String>>,
+);
+
 pub(crate) fn make_reader(
     args: &Args,
     since_valid: &Option<String>,
     until_valid: &Option<String>,
-) -> (Source, Option<(&'static str, Child)>) {
+) -> ReaderSetup {
     if let Some(filter) = &args.gcloud {
         // The agent's most expensive mistake: an unbounded Cloud Logging
         // read streams the whole retention window. Never launch it silent.
@@ -173,7 +225,7 @@ pub(crate) fn make_reader(
         // ponytail: no --limit pushdown; the fetch is bounded by your query
         // (and by the pushdown bounds above)
         let (stdout, child) = spawn_fetcher("gcloud", gc_args);
-        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("gcloud", child)))
+        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("gcloud", child)), None)
     } else if let Some(sql) = &args.bq {
         // bq CLI grammar: global flags BEFORE the command, query flags
         // after. --quiet kills the "Waiting on bqjob_…" status chatter
@@ -197,6 +249,8 @@ pub(crate) fn make_reader(
         }
         if let Some(mb) = args.max_bytes_billed {
             bq_args.push(format!("--maximum_bytes_billed={mb}"));
+        } else if let Some(bytes) = builtin_bytes_guard() {
+            bq_args.push(format!("--maximum_bytes_billed={bytes}"));
         }
         if let Some(extra) = &args.bq_args {
             // ponytail: whitespace split, no shlex — document "no quotes
@@ -212,10 +266,13 @@ pub(crate) fn make_reader(
         // tab and the header never pollutes stdout, but an agent correlating
         // trace columns needs the map somewhere. Real bq errors still show
         // (child stderr stays live).
-        if let Ok(h) = rows.headers() {
-            eprintln!("Note: bq columns: {}", h.iter().collect::<Vec<_>>().join(" | "));
+        let headers: Option<Vec<String>> = rows.headers().ok().map(|h| {
+            h.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        });
+        if let Some(h) = &headers {
+            eprintln!("Note: bq columns: {}", h.join(" | "));
         }
-        (Source::Rows(rows), Some(("bq", child)))
+        (Source::Rows(rows), Some(("bq", child)), headers)
     } else if let Some(selector) = &args.k8s {
         // kubectl logs selector (pod/name, deployment/name, bare name);
         // the namespace and context are kubectl's own (current ones).
@@ -240,14 +297,14 @@ pub(crate) fn make_reader(
             k8s_args.push(format!("--since-time={}Z", server_ts(s)));
         }
         let (stdout, child) = spawn_fetcher("kubectl", k8s_args);
-        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("kubectl", child)))
+        (Source::Lines(Box::new(BufReader::new(stdout))), Some(("kubectl", child)), None)
     } else if let Some(path) = &args.file_path {
         let file = File::open(path).unwrap_or_else(|e| {
             eprintln!("Error opening file {}: {}", path, e);
             exit(1);
         });
-        (Source::Lines(Box::new(BufReader::new(file))), None)
+        (Source::Lines(Box::new(BufReader::new(file))), None, None)
     } else {
-        (Source::Lines(Box::new(BufReader::new(io::stdin()))), None)
+        (Source::Lines(Box::new(BufReader::new(io::stdin()))), None, None)
     }
 }
