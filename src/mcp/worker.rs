@@ -202,8 +202,7 @@ pub(crate) fn execute_cardio(
             Ok((s, _trunc)) => break Exec::Done(s),
             Err(RecvTimeoutError::Timeout) => {
                 let elapsed = started.elapsed().as_secs();
-                if last_beat.elapsed().as_secs() >= 10 {
-                    last_beat = Instant::now();
+                if heartbeat_due(&mut last_beat) {
                     notify_progress(
                         tx,
                         token,
@@ -420,7 +419,7 @@ pub(crate) fn execute_command(
         match rx2.recv_timeout(Duration::from_secs(10)) {
             Ok((s, _)) => break Exec::Done(s),
             Err(RecvTimeoutError::Timeout) => {
-                if last_beat_check(&mut last_beat) {
+                if heartbeat_due(&mut last_beat) {
                     let elapsed = started.elapsed().as_secs();
                     notify_progress(tx, token, &format!(
                         "still running ({elapsed} s elapsed; big scans can be legitimately slow)"));
@@ -467,7 +466,7 @@ pub(crate) fn execute_command(
     Ok((stdout, stderr, code, cancelled))
 }
 
-fn last_beat_check(last: &mut Instant) -> bool {
+fn heartbeat_due(last: &mut Instant) -> bool {
     if last.elapsed().as_secs() >= 10 {
         *last = Instant::now();
         true

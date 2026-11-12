@@ -279,8 +279,10 @@ infinite". The v2 core is concurrent:
 - one thread per `tools/call` — heavy fetches run in parallel (capped at
   2, the third QUEUES with visible progress instead of hanging mute)
 - `notifications/cancelled` actually CANCELS: the fetch child (and its
-  whole process group, so its grandchildren cannot hold the pipes) is
-  killed on the spot and the run answers with an honest `isError`
+  whole process group on unix, so grandchildren cannot hold the pipes)
+  is killed on the spot and the run answers with an honest `isError`
+  (on Windows only the direct child dies — a CLI that spawns children
+  may keep them alive)
 - progress notifications flow whenever the client passes a progress
   token (start + a heartbeat every 10 s) — "working" never looks like
   "hung" again
@@ -288,6 +290,9 @@ infinite". The v2 core is concurrent:
   they were read sequentially); oversized output is capped (8 MiB stdout
   / 64 KiB stderr) with an in-band truncation marker — the MCP layer is
   a context window, not a filesystem
+- a dead client STOPS the money: if the client's stdout dies, the writer
+  announces it once and every fetch in flight is KILLED (waiting for a
+  20-minute bq to finish for nobody was the 1.x flaw)
 
 Results carry the trimmed lines plus cardio's stderr notes (what was
 dropped, bq column names, job ids) as separate text blocks; a nonzero

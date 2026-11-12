@@ -134,6 +134,10 @@ against UTC bounds.
 - `--k8s` mode: namespace and context are kubectl's own (current ones);
   kubectl runs with --timestamps so the local --until actually binds
   (ts-less output would bypass the range filter entirely).
+- MCP cancellation on WINDOWS: the fetch child is killed directly;
+  process groups are a unix feature, so a CLI that SPAWNS children keeps
+  them alive (and holding output pipes) after a cancel — on unix the
+  whole group dies. Timeouts still end the run either way.
 - GKE pods: Cloud Logging has them as resource.type=k8s_container — the
   --gcloud path covers GKE clusters with full pushdown; --k8s talks to
   kubectl for plain clusters or local pods.
