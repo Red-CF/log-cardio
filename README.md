@@ -99,6 +99,32 @@ Writing `AGENTS.md` to your repo root once means agent runtimes pick it
 up automatically. Agents never have to re-learn the tool by trial and
 error, which is exactly the token cost this tool exists to save.
 
+## How cardio works
+
+Every line you give cardio flows through a small pipeline, and every
+stage that drops something SAYS so on stderr:
+
+```
+              ┌──────────┐   ┌─────────────┐   ┌──────────────┐
+ input ─────► │ query    │──►│ time range  │──►│ trim (ts +   │──► dedup exact
+ (file/fetch) │ (cheap)  │   │ ISO bounds  │   │ boilerplate) │   ≤5000 unique
+              └──────────┘   └─────────────┘   └──────────────┘
+                                                    ► window ─► output
+                                                      HEAD if fetcher /
+                                                      TAIL if stream
+ each drop ─► stderr note (dedup count, cap side, field cuts) ── honest
+```
+
+WHY a window whose side follows the source: for a cloud fetcher, YOUR
+query ordering is your intent (`--bq 'SELECT ... ORDER BY ASC'` means
+the head of the result matters); for a live file, the tail is the news.
+WHY the 1000-char field cut lives in lean: JWTs and request bodies used
+to pass whole on every line. WHY dedup is exact first: two agent runs
+distrusted the bloom's 1% false positives — exactness where the trust
+lives, probabilistic cost only on huge inputs. The deep machine (the
+timestamp invariant, the MCP thread model, the fetcher guards) is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Input
 
 ```bash
@@ -242,7 +268,29 @@ the source, that a wide bq scan should dry-run first). So:
   can drift if you skip re-reading the card; the MCP tools cannot, since
   they are the same release).
 - Both channels are honest the same way: what got dropped, field maps,
-  job ids and caps arrive as explicit content, never silent.
+  job ids and caps arrive as explicit content, never silent. (WHY the
+  server stays alive under load: the 1.x core ran ONE request at a
+  time — a slow fetch froze the whole server, pings went unanswered and
+  agents watched minutes turn to infinite. The 2.0 core never lets a
+  tool call block the protocol.)
+
+The thread model:
+
+```
+ stdin ──► READER thread ──► ping answered in µs, always
+             │               (it never blocks behind a tool call)
+             ├─ tools/call ─► WORKER thread (one per call)
+             │                 ├─ both pipes drained concurrently
+             │                 ├─ heartbeat every 10 s to the client
+             │                 ├─ cancel ─► child's PROCESS GROUP killed
+             │                 └─ max 2 heavy fetches; more QUEUE visibly
+             └──► WRITER thread (owns stdout, ONE channel — no races)
+                    └─ client's stdout dies ─► running fetches KILLED
+```
+
+The full reasoning (why std threads instead of an SDK, why process
+groups, why keep-first caps) is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#5-mcp-core-reader--worker--writer).
 
 ### It is NOT Google-only
 
