@@ -75,11 +75,10 @@ pub(crate) fn serve() {
                     .cloned()
                     .unwrap_or(Value::Null);
                 let key = target.to_string();
-                if let Ok(mut reg) = registry.lock() {
-                    if let Some(flag) = reg.remove(&key) {
+                if let Ok(mut reg) = registry.lock()
+                    && let Some(flag) = reg.remove(&key) {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                }
             }
             continue;
         }
