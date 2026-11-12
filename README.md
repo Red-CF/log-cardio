@@ -330,7 +330,10 @@ table above is one local M1 run for orientation; on other hardware,
 run `./bench.sh` and read your own.
 
 That is roughly 75 MB/s on the lean path end to end (the 1000-char
-field cutoff included, byte-length fast path). The trim runs as a
+field cutoff included, byte-length fast path). One extra data point:
+`--raw --dedup-fold` costs the same as raw (≈0.21 s) — the digit fold
+is a regex over the line, not a scan. The full methodology and how the
+machine works live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The trim runs as a
 single combined regex pass. When the input comes from gcloud or bq, the
 network dominates anyway. The bench's trace scenario runs with `--raw`
 on purpose: in lean mode the session cap bounds the input early, so its
