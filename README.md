@@ -244,29 +244,54 @@ the source, that a wide bq scan should dry-run first). So:
 - Both channels are honest the same way: what got dropped, field maps,
   job ids and caps arrive as explicit content, never silent.
 
+### It is NOT Google-only
+
+The headline tool is `fetch_command`: ANY log-producing CLI (Azure, AWS,
+journalctl, docker logs — any provider, any agent runtime) is piped
+straight through cardio's lean pipeline. The named fetchers (`fetch_bq`,
+`fetch_gcloud`, `fetch_k8s`) exist ONLY to add provider-specific super
+powers (cost guards, server-side pushdown); for everything else,
+`fetch_command` is the tool.
+
 `cardio --mcp` speaks MCP (Model Context Protocol) over stdio: line-based
 JSON-RPC with tools/list and tools/call. Same binary, so the tools always
-match the flags. Six tools:
+match the flags. Eight tools:
 
 | tool | purpose |
 |---|---|
-| `trim_logs` | read a file/stdin through the lean pipeline (query/tail/head/skip/raw/json/field-cap) |
+| `read_log` | read a file through the lean pipeline (query/tail/head/skip/raw/json/field-cap) |
 | `survey_log` | the `--stats --json` survey |
 | `trace_log` | the grouping modes (trace/summary/top/head-cap) |
-| `fetch_gcloud` | Cloud Logging with pushdown bounds |
+| `census_log` | bq census: rows-per-column-value counts (the `--group-col` semantics) |
+| `fetch_command` | ANY provider CLI piped through cardio — the provider-neutral fetch |
 | `fetch_bq` | bq SQL with the cost guards (dry-run, byte caps, project) |
+| `fetch_gcloud` | Cloud Logging with pushdown bounds |
 | `fetch_k8s` | kubectl logs with the since-time pushdown |
+
+### The v2 server core (why it stays alive under load)
+
+The 1.x server froze behind a slow tool call: one request at a time, the
+read loop never returned, pings went unanswered, agents saw "minutes to
+infinite". The v2 core is concurrent:
+
+- one READ thread owns stdin — `ping` answers in microseconds even while
+  a 20-minute bq runs
+- one thread per `tools/call` — heavy fetches run in parallel (capped at
+  2, the third QUEUES with visible progress instead of hanging mute)
+- `notifications/cancelled` actually CANCELS: the fetch child (and its
+  whole process group, so its grandchildren cannot hold the pipes) is
+  killed on the spot and the run answers with an honest `isError`
+- progress notifications flow whenever the client passes a progress
+  token (start + a heartbeat every 10 s) — "working" never looks like
+  "hung" again
+- both pipes are drained concurrently (a 1.0.0 run hung 30 minutes when
+  they were read sequentially); oversized output is capped (8 MiB stdout
+  / 64 KiB stderr) with an in-band truncation marker — the MCP layer is
+  a context window, not a filesystem
 
 Results carry the trimmed lines plus cardio's stderr notes (what was
 dropped, bq column names, job ids) as separate text blocks; a nonzero
-cardio exit comes back as an `isError` result, not a client crash. When
-the client passes a progress token, fetch tools emit progress
-notifications (start + a heartbeat every 10 s) — big bq scans are LEGIT
-slow, and "working" must never look like "hung".
-Both pipes are drained concurrently (a 1.0.0 run hung 30 minutes when
-they were read sequentially); oversized output is capped (8 MiB stdout /
-64 KiB stderr) with an in-band truncation marker — the MCP layer is a
-context window, not a filesystem.
+cardio exit comes back as an `isError` result, not a client crash.
 
 For Claude Code, register it with:
 
@@ -274,8 +299,8 @@ For Claude Code, register it with:
 claude mcp add cardio -- cardio --mcp
 ```
 
-The agent then calls `trim_logs`/`survey_log`/... instead of shelling
-out: same engine, structured tools.
+The agent then calls `read_log`/`survey_log`/`fetch_command`/... instead
+of shelling out — same engine, structured tools.
 
 ## Performance
 

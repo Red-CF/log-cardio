@@ -16,3 +16,7 @@ pub(crate) const MAX_STATS_PATTERNS: usize = 100_000;
 /// IS the hang. bq jobs sit silent until done, so bq opts in explicitly —
 /// a wall-clock there kills legit long scans. 0 disables entirely.
 pub(crate) const FETCH_TIMEOUT_DEFAULT: u64 = 600;
+
+/// MCP: how many heavy fetches (bq/gcloud/k8s/fetch_command) run at once
+/// before the next one queues WITH progress. Local file tools are exempt.
+pub(crate) const MAX_CONCURRENT_FETCHES: usize = 2;
