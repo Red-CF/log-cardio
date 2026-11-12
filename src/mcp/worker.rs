@@ -115,18 +115,29 @@ impl FetchBudget {
         token: &Option<Value>,
         tx: &Sender<String>,
         cancel: &Arc<AtomicBool>,
+        client_gone: &Arc<AtomicBool>,
     ) -> Option<FetchSlotGuard> {
+        let mut last_notice = None; // queue notice once, then 10 s cadence
         loop {
             if cancel.load(Ordering::SeqCst) {
                 return None;
             }
+            if client_gone.load(Ordering::SeqCst) {
+                return None;
+            }
             let cur = self.active.load(Ordering::SeqCst);
             if cur >= self.max {
-                notify_progress(
-                    tx,
-                    token,
-                    &format!("queued behind {cur} running fetch(es) — waiting for a slot"),
-                );
+                let due = last_notice
+                    .map(|t: Instant| t.elapsed() >= Duration::from_secs(10))
+                    .unwrap_or(true);
+                if due {
+                    last_notice = Some(Instant::now());
+                    notify_progress(
+                        tx,
+                        token,
+                        &format!("queued behind {cur} running fetch(es) — waiting for a slot"),
+                    );
+                }
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
@@ -158,6 +169,7 @@ pub(crate) fn execute_cardio(
     label: &str,
     token: &Option<Value>,
     cancel: &Arc<AtomicBool>,
+    client_gone: &Arc<AtomicBool>,
     tx: &Sender<String>,
     hard_ceiling_secs: u64,
 ) -> Result<(String, String, i32, bool), String> {
@@ -182,6 +194,10 @@ pub(crate) fn execute_cardio(
         if cancel.load(Ordering::SeqCst) {
             break Exec::Cancelled;
         }
+        if client_gone.load(Ordering::SeqCst) {
+            // nobody left to read the answer — stop paying for the fetch
+            break Exec::Lost;
+        }
         match rx2.recv_timeout(Duration::from_secs(10)) {
             Ok((s, _trunc)) => break Exec::Done(s),
             Err(RecvTimeoutError::Timeout) => {
@@ -200,7 +216,7 @@ pub(crate) fn execute_cardio(
                 // the caller via cancel flag + explicit timeout; here the
                 // budget clock is advisory (progress), the hard kill only
                 // fires on cancellation
-                if hard_ceiling_secs > 0 && elapsed > hard_ceiling_secs.saturating_mul(3) {
+                if hard_ceiling_secs > 0 && elapsed > hard_ceiling_secs {
                     // sanity ceiling: 3x the streaming default even without
                     // an explicit timeout — nothing runs "to infinity"
                     break Exec::Cancelled;
@@ -251,56 +267,73 @@ pub(crate) fn run_and_respond(
     cancel: Arc<AtomicBool>,
     budget: Arc<FetchBudget>,
     tx: Sender<String>,
+    client_gone: Arc<AtomicBool>,
 ) {
+    // The cancelled wording lives in BOTH arms: a silent drop of the
+    // cancelled flag is exactly how the honest text was lost once.
+    let add_note = |mut e: String, cancelled: bool| {
+        if cancelled {
+            e.push_str("\ncancelled — the fetch child was killed on the client's behalf");
+        }
+        e
+    };
     let result: Result<(String, String, i32), String> = match job {
-        super::tools::ToolJob::Cardio(argv) => {
+        super::tools::ToolJob::Cardio { argv, heavy } => {
             let label = tool_label(&argv);
-            // hard ceiling: 3x the streaming default keeps an unkillable run
-            // from living "to infinity" even without a client cancel
-            let ceiling = if budget.max > 0 { 3 * crate::consts::FETCH_TIMEOUT_DEFAULT } else { 0 };
-            budget
-                .acquire(&token, &tx, &cancel)
-                .ok_or_else(|| "cancelled".to_string())
-                .and_then(|_slot| execute_cardio(&argv, &label, &token, &cancel, &tx, ceiling))
-                .map(|(s, e, c, cancelled)| {
-                    let e = if cancelled {
-                        format!("{e}\ncancelled — the fetch child was killed on the client's behalf")
-                    } else {
-                        e
-                    };
-                    (s, e, c)
-                })
+            // the hard ceiling applies ONCE here (3x the streaming
+            // default); execute_cardio takes it bare — the double-3x bug
+            // (a 5400 s "30 min ceiling") came from multiplying twice.
+            // HEAVY-ONLY budget: the old budget gated local file reads and
+            // left the real fetches uncapped — exactly inverted.
+            let run = if heavy {
+                budget
+                    .acquire(&token, &tx, &cancel, &client_gone)
+                    .ok_or_else(|| "cancelled".to_string())
+                    .and_then(|_slot| {
+                        execute_cardio(&argv, &label, &token, &cancel, &client_gone, &tx, ceiling())
+                    })
+            } else {
+                execute_cardio(&argv, &label, &token, &cancel, &client_gone, &tx, ceiling())
+            };
+            run.map(|(stdout, stderr, code, cancelled)| {
+                (stdout, add_note(stderr, cancelled), code)
+            })
         }
         super::tools::ToolJob::Command { program, args, cardio_args, timeout } => {
-            let ceiling = timeout.unwrap_or(crate::consts::FETCH_TIMEOUT_DEFAULT);
-            execute_command(&program, &args, &cardio_args, &token, &cancel, &tx, ceiling)
-                .map(|(s, e, c, cancelled)| {
-                    let e = if cancelled {
-                        format!("{e}\ncancelled — the fetch child was killed on the client's behalf")
-                    } else {
-                        e
-                    };
-                    (s, e, c)
+            budget
+                .acquire(&token, &tx, &cancel, &client_gone)
+                .ok_or_else(|| "cancelled".to_string())
+                .and_then(|_slot| {
+                    execute_command(
+                        &program, &args, &cardio_args, &token, &cancel, &client_gone, &tx,
+                        timeout.unwrap_or(crate::consts::FETCH_TIMEOUT_DEFAULT),
+                    )
+                })
+                .map(|(stdout, stderr, code, cancelled)| {
+                    (stdout, add_note(stderr, cancelled), code)
                 })
         }
     };
     let line = match result {
-        Ok((stdout, stderr, code)) => json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": tool_result(&stdout, &stderr, code != 0)
-        }).to_string(),
-        Err(msg) if msg == "cancelled" => json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {"content": [{"type": "text", "text": "cancelled — the fetch child was killed on the client's behalf"}], "isError": true}
-        }).to_string(),
-        Err(msg) => json!({
-            "jsonrpc": "2.0", "id": id,
-            "result": {"content": [{"type": "text", "text": msg}], "isError": true}
-        }).to_string(),
+        Ok((stdout, stderr, code)) => {
+            json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": tool_result(&stdout, &stderr, code != 0)
+            }).to_string()
+        }
+        Err(msg) => {
+            json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"content": [{"type": "text", "text": msg}], "isError": true}
+            }).to_string()
+        }
     };
     let _ = tx.send(line);
 }
 
+fn ceiling() -> u64 {
+    3 * crate::consts::FETCH_TIMEOUT_DEFAULT
+}
 fn tool_label(argv: &[String]) -> String {
     // first NON-flag arg names the tool run (readability in progress msgs)
     argv.iter().find(|a| !a.starts_with('-')).cloned().unwrap_or_else(|| "cardio".into())
@@ -310,12 +343,14 @@ fn tool_label(argv: &[String]) -> String {
 /// piped into cardio's stdin — the tool that makes "not only for google"
 /// literally true. Provider stderr stays INHERITED (its own job notes);
 /// cardio's output is captured like every other job.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_command(
     program: &str,
     args: &[String],
     cardio_args: &[String],
     token: &Option<Value>,
     cancel: &Arc<AtomicBool>,
+    client_gone: &Arc<AtomicBool>,
     tx: &Sender<String>,
     ceiling_secs: u64,
 ) -> Result<(String, String, i32, bool), String> {
@@ -328,14 +363,24 @@ pub(crate) fn execute_command(
             format!("cannot run {program}: {e} — is the CLI installed and on PATH?")
         })?
     };
+    // Every failure AFTER this spawn must kill+reap the provider: an
+    // unowned journalctl/az stream is an orphan burning the client's
+    // stderr (the leak the review caught).
+    macro_rules! bail_provider {
+        ($msg:expr) => {{
+            crate::source::kill_fetcher(&mut provider);
+            let _ = provider.wait();
+            return Err($msg);
+        }};
+    }
     let Some(pout) = provider.stdout.take() else {
-        return Err(format!("{program} stdout missing"));
+        bail_provider!(format!("{program} stdout missing"));
     };
     // THE GENUINE cardio: CARDIO_BIN points at fake tools in tests — using
     // it here would run the provider script as "cardio" again (timestamps
     // would never trim, the run would double-spawn the provider)
     let Some(cardio_bin) = super::sibling_cardio() else {
-        return Err("cardio binary not found next to the MCP server; fetch_command always uses the real sibling".into());
+        bail_provider!("cardio binary not found next to the MCP server; fetch_command always uses the real sibling".to_string());
     };
     let mut cardio = {
         let mut c = Command::new(cardio_bin);
@@ -345,7 +390,10 @@ pub(crate) fn execute_command(
             .stderr(Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
-        c.spawn().map_err(|e| format!("cannot run cardio over {program}: {e}"))?
+        match c.spawn() {
+            Ok(ch) => ch,
+            Err(e) => bail_provider!(format!("cannot run cardio over {program}: {e}")),
+        }
     };
     let Some(mut so) = cardio.stdout.take() else {
         return Err("cardio stdout missing".into());
@@ -365,6 +413,9 @@ pub(crate) fn execute_command(
     let outcome = loop {
         if cancel.load(Ordering::SeqCst) {
             break Exec::Cancelled;
+        }
+        if client_gone.load(Ordering::SeqCst) {
+            break Exec::Lost;
         }
         match rx2.recv_timeout(Duration::from_secs(10)) {
             Ok((s, _)) => break Exec::Done(s),

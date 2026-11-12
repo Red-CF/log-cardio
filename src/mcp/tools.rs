@@ -131,8 +131,11 @@ pub(crate) static SCHEMA: LazyLock<Vec<Value>> = LazyLock::new(|| vec![
 /// What a tool call turns into: most tools run CARDIO_BIN with argv;
 /// fetch_command runs an arbitrary provider CLI piped into cardio stdin
 /// (the worker owns both children, cancellation kills the whole chain).
+/// `heavy` marks the cloud/streaming fetches that share the fetch budget
+/// — local FILE tools are exempt (a 2-minute bq never queues a 10-ms file
+/// read; an unbounded az tail does consume a budget slot).
 pub(crate) enum ToolJob {
-    Cardio(Vec<String>),
+    Cardio { argv: Vec<String>, heavy: bool },
     Command {
         program: String,
         args: Vec<String>,
@@ -175,6 +178,7 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<ToolJob, String> {
     let top = num(&args, "top")?;
     let bytes = num(&args, "max_bytes_billed")?;
     let timeout_secs = num(&args, "timeout_secs")?;
+    let mut heavy = false;
     let mut cardio_args: Vec<String> = Vec::new();
     if let Some(v) = skip { cardio_args.extend(["--skip".into(), v.to_string()]); }
     if let Some(v) = tail { cardio_args.extend(["--tail".into(), v.to_string()]); }
@@ -187,7 +191,7 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<ToolJob, String> {
         "read_log" => {
             let Some(path) = s("path") else { return Err("missing: path".into()) };
             if path == "-" || path.is_empty() {
-                return Err("trim_logs reads FILES only (the server's own stdio is the MCP channel); pipe through the cardio CLI for stdin sources".into());
+                return Err("read_log reads FILES only (the server's own stdio is the MCP channel); pipe through the cardio CLI for stdin sources".into());
             }
             argv.push(path.into());
             argv.extend(cardio_args.clone());
@@ -208,12 +212,14 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<ToolJob, String> {
             if let Some(v) = head { argv.extend(["--head".into(), v.to_string()]); }
         }
         "fetch_gcloud" => {
+            heavy = true;
             let Some(filter) = s("filter") else { return Err("missing: filter".into()) };
             argv.extend(["--gcloud".into(), filter.into()]);
             if let Some(v) = s("since") { argv.extend(["--since".into(), v.into()]); }
             if let Some(v) = s("until") { argv.extend(["--until".into(), v.into()]); }
         }
         "fetch_bq" => {
+            heavy = true;
             let Some(sql) = s("sql") else { return Err("missing: sql".into()) };
             argv.extend(["--bq".into(), sql.into()]);
             if b("dry_run").unwrap_or(false) { argv.push("--dry-run".into()); }
@@ -222,6 +228,7 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<ToolJob, String> {
             if let Some(v) = s("bq_args") { argv.extend(["--bq-args".into(), v.into()]); }
         }
         "census_log" => {
+            heavy = true;
             let Some(sql) = s("sql") else { return Err("missing: sql".into()) };
             let Some(cols) = args.get("columns").and_then(Value::as_array) else {
                 return Err("missing: columns".into());
@@ -258,6 +265,7 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<ToolJob, String> {
             });
         }
         "fetch_k8s" => {
+            heavy = true;
             let Some(sel) = s("selector") else { return Err("missing: selector".into()) };
             argv.extend(["--k8s".into(), sel.into()]);
             if let Some(c) = s("container") { argv.extend(["-c".into(), c.into()]); }
@@ -267,5 +275,5 @@ pub(crate) fn execute(name: &str, args: Value) -> Result<ToolJob, String> {
         }
         other => return Err(format!("unknown tool: {other}")),
     }
-    Ok(ToolJob::Cardio(argv))
+    Ok(ToolJob::Cardio { argv, heavy })
 }
