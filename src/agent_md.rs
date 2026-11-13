@@ -65,35 +65,53 @@ would sit). Pass value-flags first when unsure.
 
 ## Flags
 
-| Flag | Effect |
-|---|---|
-| `--tail N` | keep only the LAST N kept lines — the most recent beat the old; the #1 read when you want what the log just said |
-| `--head N` | keep only the FIRST N kept lines — the lean default for cloud fetchers; in --trace/--summary mode this is the event cap (earliest events win) |
-| `--skip N` | drop the first N kept lines before the window; bq pages as `--skip 100 --head 100` |
-| `--raw` | skip the agent pipeline: verbatim. No dedup, no cap, no trim, no field cut (timestamps and levels survive) |
-| `--query error` | keep only lines containing TEXT (substring) |
-| `--json` | NDJSON output: {"index","content"} |
-| `--since TS` / `--until TS` | keep lines with timestamp >= TS / < TS |
-| `--trace REGEX` | group lines by captured ID (e.g. request_id=...), sessions listed at the end |
-| `--summary` | with --trace: compact per-ID map (count + first/last). Use `--top N` when IDs are many |
-| `--top N` | trace mode (full or summary): keep only the biggest N sessions, the rest drop with a note |
-| `--max-field-len N` | cut huge fields or lines (XML/JWT bodies) after N chars with a "…" marker (lean default 1000; 0 = unlimited) |
-| `--stats` | survey mode: top-pattern frequencies, no stream output. Digit runs fold to #, so per-id noise groups |
-| `--dedup-fold` | a dedup level for censuses: lines differing only in digit runs collapse (folds digits to # like --stats); the run notes say it |
-| `--group-col day,status` | bq census: count rows per column value, printed like --stats (NDJSON with --json). Rows go verbatim; only with --bq |
-| `--stats --json` | same survey as NDJSON on stdout: {"pattern","count"} |
-| `--dedup` | with --raw: drop repeated lines after all (lean mode has dedup on by default) |
+The flags follow the read itself: WHERE the log comes from, then how to
+narrow it, how to shape the output, how to analyze it, then bq extras,
+runtime knobs and the special modes.
+
+Sources (exactly one):
 | `--gcloud FILTER` | stream Cloud Logging (--since/--until pushed server-side) |
 | `--bq "SQL"` | stream BigQuery rows via the bq CLI (CSV) |
 | `--k8s SELECTOR` | stream `kubectl logs` for a pod/deployment/bare name; --since pushes to --since-time |
 | `-c, --container NAME` | with --k8s: the container of the pod (kubectl -c) |
+
+Narrow the read:
+| `--query error` | keep only lines containing TEXT (substring) |
+| `--since TS` / `--until TS` | keep lines with timestamp >= TS / < TS |
+
+Shape the output:
+| `--tail N` | keep only the LAST N kept lines: the #1 read when you want what the log just said |
+| `--head N` | keep only the FIRST N kept lines: the lean default for cloud fetchers; in --trace/--summary mode this is the event cap (earliest events win) |
+| `--skip N` | drop the first N kept lines before the window; bq pages as `--skip 100 --head 100` |
+| `--max-field-len N` | cut huge fields or lines (XML/JWT bodies) after N chars with a "…" marker (lean default 1000; 0 = unlimited) |
+
+Pipeline levels:
+| `--raw` | skip the agent pipeline: verbatim. No dedup, no cap, no trim (timestamps and levels survive) |
+| `--dedup` | with --raw: drop repeated lines after all (lean mode has dedup on by default) |
+| `--dedup-fold` | a dedup level for censuses: lines differing only in digit runs collapse (folds digits to # like --stats); the run notes say it |
+
+Analysis modes:
+| `--trace REGEX` | group lines by captured ID (e.g. request_id=...), sessions listed at the end |
+| `--summary` | with --trace: compact per-ID map (count + first/last). Use `--top N` when IDs are many |
+| `--top N` | trace mode (full or summary): keep only the biggest N sessions, the rest drop with a note |
+| `--stats` | survey mode: top-pattern frequencies, no stream output. Digit runs fold to #, so per-id noise groups |
+| `--stats --json` | same survey as NDJSON on stdout: {"pattern","count"} |
+| `--group-col day,status` | bq census: count rows per column value, printed like --stats (NDJSON with --json). Rows go verbatim; only with --bq |
+
+Output format:
+| `--json` | NDJSON output: {"index","content"} |
+
+bq cost and execution extras:
 | `--dry-run` | bq only: cost estimate (`bq query --dry_run`), no rows read |
 | `--max-bytes-billed N` | bq only: errors out if the job would bill more than N bytes |
 | `--project ID` | bq only: project that runs the job (default: the CLI's configured project) |
 | `--bq-args "..."` | bq only: raw bq CLI flags passthrough (split on whitespace, no quotes inside) |
+
+Runtime and modes:
 | `--timeout SECS` | kill a hung fetcher (its job id stays in stderr). DEFAULT 600 s on STREAMING fetchers (gcloud, k8s) — a stopped flow IS the hang. bq waits whole jobs: it needs an EXPLICIT --timeout (0 = disable) |
 | `--config FILE` | custom timestamp/boilerplate regexes and default_trace (TOML) |
 | `--mcp` | run as an MCP stdio server exposing these modes as tools (see cardio's README) |
+| `--agent-md` | print this card |
 
 ## Output shape
 Default: one line per kept event, boilerplate trimmed away. `--json`:
@@ -134,6 +152,10 @@ against UTC bounds.
 - `--k8s` mode: namespace and context are kubectl's own (current ones);
   kubectl runs with --timestamps so the local --until actually binds
   (ts-less output would bypass the range filter entirely).
+- MCP cancellation on WINDOWS: the fetch child is killed directly;
+  process groups are a unix feature, so a CLI that SPAWNS children keeps
+  them alive (and holding output pipes) after a cancel — on unix the
+  whole group dies. Timeouts still end the run either way.
 - GKE pods: Cloud Logging has them as resource.type=k8s_container — the
   --gcloud path covers GKE clusters with full pushdown; --k8s talks to
   kubectl for plain clusters or local pods.

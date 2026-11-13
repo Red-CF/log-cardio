@@ -173,6 +173,12 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # git-cliff needs the full commit chain + tags
+      - name: install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
       - id: decide
         name: release only if this version is new to crates.io
         run: |
@@ -210,7 +216,24 @@ jobs:
           git config user.email "crojasfer31@gmail.com"
           git tag "v$V"
           git push origin "v$V"
-          gh release create "v$V" --generate-notes
+          # automatic changelog: git-cliff derives the release notes from
+          # the commits since the previous tag (replaces --generate-notes),
+          # and the full history goes to gh-pages; no hand-written file
+          git-cliff --unreleased --strip all > notes.md
+          gh release create "v$V" --notes-file notes.md
+          git-cliff -o changelog.md
+      - name: publish changelog to gh-pages
+        if: steps.decide.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          URL="https://x-access-token:${GH_TOKEN}@github.com/Red-CF/log-cardio.git"
+          git clone -q --depth=1 --branch=gh-pages "$URL" ghpc \
+            || { mkdir ghpc && git -C ghpc init -q -b gh-pages && git -C ghpc remote add origin "$URL"; }
+          mv changelog.md ghpc/CHANGELOG.md
+          git -C ghpc -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add CHANGELOG.md
+          git -C ghpc -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "changelog refresh" --allow-empty
+          git -C ghpc push -q origin gh-pages
       - uses: actions/download-artifact@v8
         if: steps.decide.outputs.release == 'true'
         with:

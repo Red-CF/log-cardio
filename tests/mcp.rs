@@ -30,7 +30,7 @@ fn server() -> Server {
         .arg("--mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("cardio --mcp spawns");
     let out = BufReader::new(child.stdout.take().expect("mcp stdout"));
@@ -66,10 +66,11 @@ fn mcp_handshake_and_tool_list() {
         .as_array().expect("tools array")
         .iter().map(|t| t["name"].as_str().expect("tool name")).collect();
     assert_eq!(
-        names.len(), 6,
-        "6 tools: {names:?}"
+        names.len(), 8,
+        "8 tools: {names:?}"
     );
-    for want in ["trim_logs", "survey_log", "trace_log", "fetch_gcloud", "fetch_bq", "fetch_k8s"] {
+    for want in ["read_log", "survey_log", "trace_log", "census_log",
+                 "fetch_gcloud", "fetch_bq", "fetch_k8s", "fetch_command"] {
         assert!(names.contains(&want), "tool {want} present: {names:?}");
     }
 
@@ -88,7 +89,7 @@ fn mcp_trim_logs_tool_call() {
         .expect("fixture");
     let mut srv = server();
     let call = format!(
-        r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"trim_logs","arguments":{{"path":"{}"}}}}}}"#,
+        r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"read_log","arguments":{{"path":"{}"}}}}}}"#,
         path.display()
     );
     send(&mut srv, &call);
@@ -127,7 +128,7 @@ fn server_with_bin(bin: &str) -> Server {
         .env("CARDIO_BIN", bin)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("cardio --mcp spawns with CARDIO_BIN");
     let out = BufReader::new(child.stdout.take().expect("mcp stdout"));
@@ -213,5 +214,98 @@ fn mcp_no_token_no_noise() {
         }
     }
     assert_eq!(noise, 0, "untokenized progress is a protocol violation");
+    drop(srv);
+}
+
+// ---- v2 core: the server must stay ALIVE while a slow tool runs ----
+// The 1.x defect the whole redesign exists for: one tool call froze the
+// read loop, pings went unanswered, agents saw "minutes to infinite".
+
+fn slow_body() -> String {
+    fake_cardio("sleep 12; echo eventually-done")
+}
+
+#[test]
+fn mcp_ping_answers_while_a_tool_runs() {
+    let mut srv = server_with_bin(&slow_body());
+    send(&mut srv, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#);
+    let _init = read_response(&mut srv);
+    // start the slow tool
+    send(&mut srv, r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"fetch_bq","arguments":{"sql":"SELECT 1"}}}"#);
+    // while it runs: a ping MUST answer (the reader loop never blocks)
+    send(&mut srv, r#"{"jsonrpc":"2.0","id":50,"method":"ping"}"#);
+    let mut pong_seen = false;
+    let mut tool = None;
+    for _ in 0..10 {
+        let msg = read_response(&mut srv);
+        if msg.get("id").and_then(|v| v.as_u64()) == Some(50) {
+            pong_seen = true;
+            assert_eq!(msg["result"], serde_json::json!({}), "ping result: {msg:?}");
+        }
+        if msg.get("id").and_then(|v| v.as_u64()) == Some(9) {
+            tool = Some(msg);
+            break;
+        }
+    }
+    assert!(pong_seen, "pong arrived while the tool ran");
+    let resp = tool.expect("tool response eventually");
+    let text: String = resp["result"]["content"].as_array().expect("content")
+        .iter().map(|c| c["text"].as_str().unwrap_or("")).collect();
+    assert!(text.contains("eventually-done"), "tool finished: {text:?}");
+    drop(srv);
+}
+
+#[test]
+fn mcp_cancellation_kills_the_child() {
+    // the slow child is told to mark a file when it WAKES UP; if the
+    // server only "pretended" to cancel, the file would appear later
+    let marker = std::env::temp_dir().join(format!(
+        "cardio_cancel_{}.marker", SEQ.fetch_add(1, Ordering::Relaxed)));
+    let body = format!(
+        "sleep 25; touch {}",
+        marker.to_string_lossy().replace('\\', "/")
+    );
+    let bin = fake_cardio(&body);
+    let mut srv = server_with_bin(&bin);
+    send(&mut srv, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#);
+    let _init = read_response(&mut srv);
+    send(&mut srv, r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"fetch_bq","arguments":{"sql":"SELECT 1"}}}"#);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let cancel_t0 = std::time::Instant::now();
+    send(&mut srv, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}"#);
+    let resp = read_response(&mut srv);
+    let elapsed = cancel_t0.elapsed();
+    assert_eq!(resp.get("id").and_then(|v| v.as_u64()), Some(9), "cancelled call answers its id: {resp:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "cancellation is immediate, not after 25 s: {elapsed:?}"
+    );
+    let text: String = resp["result"]["content"].as_array().expect("content")
+        .iter().map(|c| c["text"].as_str().unwrap_or("")).collect();
+    assert!(text.contains("cancelled"), "honest result: {text:?}");
+    drop(srv);
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_fetch_command_is_provider_neutral() {
+    // ANY CLI: here, a stub "log provider" piped through the lean pipeline
+    // — the tool that makes "not only for google" literally true
+    let provider = fake_cardio("echo 2026-11-12T10:00:00 INFO hello-azure; echo 2026-11-12T10:00:01 INFO more");
+    let mut srv = server_with_bin(&provider);
+    send(&mut srv, r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#);
+    let _init = read_response(&mut srv);
+    let call = format!(
+        r#"{{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{{"name":"fetch_command","arguments":{{"command":"{}","args":["--flag"]}} }}}}"#,
+        provider
+    );
+    send(&mut srv, &call);
+    let resp = read_response(&mut srv);
+    assert_eq!(resp["result"]["isError"], false, "provider pipe worked: {resp:?}");
+    let text: String = resp["result"]["content"].as_array().expect("content")
+        .iter().map(|c| c["text"].as_str().unwrap_or("")).collect();
+    assert!(text.contains("hello-azure"), "provider stdout flowed: {text:?}");
+    assert!(!text.contains("2026-11-12"), "lean trimmed the ts: {text:?}");
     drop(srv);
 }
