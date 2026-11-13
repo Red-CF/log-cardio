@@ -309,8 +309,9 @@ flags. The server is concurrent: a ping answers in microseconds while a
 20-minute fetch runs, cancellation kills the fetch's process group, a
 dead client stops the spend, and heavy fetches are capped at 2 while
 the rest queue with progress. The details, with the thread diagram,
-live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the story of the
-1.x freeze is now in [CHANGELOG.md](CHANGELOG.md).
+live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the release history is
+generated automatically by git-cliff at every release and published to
+[gh-pages](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/CHANGELOG.md).
 
 | tool | purpose |
 |---|---|
