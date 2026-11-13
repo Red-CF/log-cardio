@@ -5,7 +5,7 @@
 [![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![bench](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/bench.svg)](https://htmlpreview.github.io/?https://github.com/Red-CF/log-cardio/blob/gh-pages/bench.html)
-[![supported](https://img.shields.io/badge/supported-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](https://github.com/Red-CF/log-cardio/releases)
+[![supported](https://img.shields.io/badge/supported-macOS%20(ARM64%20%26%20Intel)%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](https://github.com/Red-CF/log-cardio/releases)
 
 cardio is a fast Rust CLI that trims logs so LLM agents read them with a
 fraction of the tokens.
