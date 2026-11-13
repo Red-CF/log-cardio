@@ -47,7 +47,7 @@ pub(crate) fn emit(
     }
     if result.window_full && !n.explicit_tail {
         eprintln!(
-            "Note: kept the last {} lines — the most recent; the rest of the input was read and trimmed (--raw removes the cap; --query TEXT narrows before reading).",
+            "Note: kept the last {} lines (the most recent); the rest of the input was read and trimmed (--raw removes the cap; --query TEXT narrows before reading).",
             LEAN_MAX_LINES
         );
     }
