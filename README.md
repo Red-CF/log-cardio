@@ -149,8 +149,8 @@ WHY the 1000-char field cut lives in lean: JWTs and request bodies used
 to pass whole on every line. WHY dedup is exact first: two agent runs
 distrusted the bloom's 1% false positives — exactness where the trust
 lives, probabilistic cost only on huge inputs. The deep machine (the
-timestamp invariant, the MCP thread model, the fetcher guards) is in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+timestamp invariant, the MCP thread model, the fetcher guards) lives in
+the source: `src/timestamps.rs`, `src/mcp/`, `src/source.rs`.
 
 ## Input
 
@@ -316,8 +316,8 @@ The thread model:
 ```
 
 The full reasoning (why std threads instead of an SDK, why process
-groups, why keep-first caps) is in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#5-mcp-core-reader--worker--writer).
+groups, why keep-first caps) is in the code docs: `src/mcp/mod.rs`,
+`src/mcp/worker.rs`.
 
 ### It is NOT Google-only
 
@@ -407,8 +407,8 @@ run `./bench.sh` and read your own.
 That is roughly 75 MB/s on the lean path end to end (the 1000-char
 field cutoff included, byte-length fast path). One extra data point:
 `--raw --dedup-fold` costs the same as raw (≈0.21 s) — the digit fold
-is a regex over the line, not a scan. The full methodology and how the
-machine works live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The trim runs as a
+is a regex over the line, not a scan. The methodology is in `bench.sh`
+itself. The trim runs as a
 single combined regex pass. When the input comes from gcloud or bq, the
 network dominates anyway. The bench's trace scenario runs with `--raw`
 on purpose: in lean mode the session cap bounds the input early, so its
