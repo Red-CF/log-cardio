@@ -15,8 +15,35 @@ line by line with near-constant memory. Agents can also fetch the logs
 themselves — `--gcloud`, `--bq`, or `--k8s` for pod logs — and learn the
 whole tool from one card (`cardio --agent-md`).
 
-The project is taking its first 1.0.0 steps: tests are all green, and
-the honest numbers live in the [Performance](#performance) section.
+The project is in early-days mode (2.0.0 just shipped): every test
+green, and the honest numbers live in the [Performance](#performance)
+section.
+
+## Who is cardio for?
+
+- **You debug with LLM agents** (Claude Code, Codex, Cursor...) and are
+  tired of them burning half the context window repeating the same line
+  800 times or pasting 4KB request bodies whole. cardio is the log layer
+  the agent keeps on the other side: it trims, dedups, censors and
+  windows — and its own card teaches the agent the contract so it stops
+  guessing.
+- **You work on GCP or Kubernetes** and the agent fetches logs itself:
+  `--gcloud`, `--bq` and `--k8s` push time bounds SERVER-side, so the
+  agent downloads only the window it asks for — with cost guards
+  (`--dry-run`, byte caps, env guard) so a first-pass exploratory query
+  fails fast instead of scanning 68GB.
+- **You run any other source** — Azure, AWS, journalctl, docker logs,
+  plain files: cardio's engine reads stdin and its MCP `fetch_command`
+  pipes any provider CLI through the same pipeline. Google is a preset,
+  not a prerequisite.
+- **You care about trust in what the agent reads**: every drop says so
+  on stderr — repeats collapsed, what the window kept, what got cut.
+  No silent loss, ever.
+
+NOT for: small logs that fit the context anyway (plain shell is free
+and always installed), log pipelines that never feed an LLM, or teams
+looking for a retention/aggregation product — cardio is a read layer
+for agents, not an observability suite.
 
 ## Why not just grep?
 
