@@ -1,23 +1,49 @@
 # log-cardio 🏃🏼‍♂️
 
 [![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
-[![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/coverage.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
+[![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/lcov.info)](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/lcov.info)
 [![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![bench](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/bench.svg)](https://htmlpreview.github.io/?https://github.com/Red-CF/log-cardio/blob/gh-pages/bench.html)
-[![macOS ARM64](https://img.shields.io/badge/macOS-ARM64-999999.svg)](https://github.com/Red-CF/log-cardio/releases)
-[![macOS Intel](https://img.shields.io/badge/macOS-Intel-999999.svg)](https://github.com/Red-CF/log-cardio/releases)
-[![Linux](https://img.shields.io/badge/Linux-X64-fcc624.svg)](https://github.com/Red-CF/log-cardio/releases)
-[![Windows](https://img.shields.io/badge/Windows-X64-0078d6.svg)](https://github.com/Red-CF/log-cardio/releases)
+[![platforms](https://img.shields.io/badge/OS-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](https://github.com/Red-CF/log-cardio/releases)
 
-`cardio` is a fast Rust CLI that trims the fat from logs so LLM agents
-spend fewer tokens reading them. Logs can be GBs and cardio streams them
-line by line with near-constant memory. Agents can also fetch the logs
-themselves (`--gcloud`, `--bq`, or `--k8s` for pod logs) and learn the
-whole tool from one card (`cardio --agent-md`).
+cardio is a fast Rust CLI that trims logs so LLM agents read them with a
+fraction of the tokens.
 
-The project is young: 2.0.0 is the current milestone, every test is
-green, and the honest numbers live in the [Performance](#performance)
-section.
+## Before and after
+
+```
+$ wc -l app.log
+1204331 app.log
+
+$ cardio app.log | wc -l
+2000
+```
+
+stderr, during the run:
+
+```
+Note: dedup dropped 812431 repeat lines. Under the 5000-unique-lines
+mark dedup is exact; above it, a few may actually be unique.
+Note: kept the last 2000 lines (the most recent); the rest of the
+input was read and trimmed (--raw removes the cap; --query TEXT
+narrows before reading).
+```
+
+And a raw sample against the output:
+
+```
+raw:                                            output:
+2026-10-09T12:00:00Z INFO auth: login ok    ->  auth: login ok user=carlos
+2026-10-09T12:00:03Z INFO auth: login ok    ->  (repeated: collapsed)
+2026-10-09T12:00:09Z DEBUG auth: refresh    ->  auth: refresh attempt
+2026-10-09T12:00:12Z ERROR auth: expired    ->  ERROR auth: expired user=carlos
+2026-10-09T12:00:15Z INFO api: 12ms         ->  api: request served in 12ms
+```
+
+Nothing that mattered was lost: repeats are gone, DEBUG boilerplate is
+stripped, and the ERROR keeps its level because the trim only shreds
+INFO/DEBUG/TRACE.
 
 ## Who is cardio for?
 
@@ -81,36 +107,21 @@ curl -fsSL https://raw.githubusercontent.com/Red-CF/log-cardio/main/install.sh |
 
 Windows: grab the `cardio-Windows-X64.exe` from the
 [releases page](https://github.com/Red-CF/log-cardio/releases) and put
-it on your `PATH`.
-
-Or build from source:
-
-```bash
-cargo install --path .
-```
+it on your `PATH`. Or build from source with `cargo install --path .`.
 
 ## Updating and uninstalling
 
-- **Installed with cargo**: update by re-running `cargo install log-cardio`;
-  remove with `cargo uninstall cardio`.
-- **Installed with the script**: update by re-running the install script
-  (it overwrites the binary with the latest release):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Red-CF/log-cardio/main/install.sh | sh
-```
-
-Remove it:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Red-CF/log-cardio/main/uninstall.sh | sh
-```
-
-cardio installs exactly one file, a static binary (at `/usr/local/bin/cardio`
-or `~/.local/bin/cardio`). There is no config, cache, or daemon anywhere:
-deleting that file is a complete removal.
-
+- **Installed with cargo**: update by re-running `cargo install
+  log-cardio`; remove with `cargo uninstall log-cardio`.
+- **Installed with the script**: update by re-running the install
+  command above (it overwrites the binary with the latest release);
+  remove with the `uninstall.sh` command above.
 - **Windows**: delete the `.exe` you put on your `PATH`.
+
+cardio installs exactly one file, a static binary (at
+`/usr/local/bin/cardio` or `~/.local/bin/cardio`). No config file is
+read unless you pass `--config`, and there is no cache or daemon
+anywhere: deleting that file is a complete removal.
 
 ## First run: getting oriented
 
@@ -129,38 +140,25 @@ error, which is exactly the token cost this tool exists to save.
 
 ## How cardio works
 
-Every line flows through a small pipeline, and every stage that drops
+Every line flows through a pipeline, and every stage that drops
 something says so on stderr:
 
+```text
+            ┌──────────┐   ┌─────────────┐   ┌──────────────┐
+input ────► │ query    │──►│ time range  │──►│ trim (ts +   │► dedup exact
+(file/fetch)│ (cheap)  │   │ ISO bounds  │   │ boilerplate) │  ≤5000 unique
+            └──────────┘   └─────────────┘   └──────────────┘
+        ┌────────────────────────────────────────────────┘
+        ▼ window (HEAD if fetcher / TAIL if stream) ─► output
+
+each drop ─► stderr note (dedup count, cap side, field cuts) ─► honest
 ```
-              ┌──────────┐   ┌─────────────┐   ┌──────────────┐
- input ─────► │ query    │──►│ time range  │──►│ trim (ts +   │──► dedup exact
- (file/fetch) │ (cheap)  │   │ ISO bounds  │   │ boilerplate) │   ≤5000 unique
-              └──────────┘   └─────────────┘   └──────────────┘
-                                                    ► window ─► output
-                                                      HEAD if fetcher /
-                                                      TAIL if stream
- each drop ─► stderr note (dedup count, cap side, field cuts) ── honest
-```
 
-Some of the whys, because they came from real failures rather than
-design taste:
-
-- **The window side follows the source.** For a cloud fetcher, your
-  query ordering is your intent: `--bq 'SELECT ... ORDER BY ASC'`
-  means the head of the result matters. For a live file, the tail is
-  the news.
-- **The 1000-char field cut is on by default in lean.** JWTs and
-  request bodies used to pass whole on every line, eating context for
-  nothing.
-- **Dedup is exact for small inputs.** Two agent runs distrusted the
-  bloom filter's 1% false positives, so the first 5000 unique lines are
-  deduplicated exactly and only huge noisy inputs pay the
-  probabilistic cost.
-
-The deeper machinery (the timestamp invariant, the MCP thread model,
-the fetcher guards) lives in the source: `src/timestamps.rs`,
-`src/mcp/`, `src/source.rs`.
+If you keep one explanation, keep the warning that follows: it lists
+the three deliberate drops and when to use `--raw` instead. The deep
+machinery (the timestamp invariant, the MCP thread model, the fetcher
+guards) lives in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Input
 
@@ -173,7 +171,8 @@ kubectl logs -f pod/x | cardio  # ANY provider works through plain stdin
 cardio --raw app.log            # fidelity: no dedup, no cap, no trim at all
 ```
 
-> **⚠ The default (lean) pipeline drops lines.** Three deliberate ways,
+> [!WARNING]
+> **The default (lean) pipeline drops lines.** Three deliberate ways,
 > each announced on stderr so the read stays trustworthy:
 >
 > 1. Repeated whole lines are removed. Dedup is exact for the first
@@ -193,7 +192,10 @@ cardio --raw app.log            # fidelity: no dedup, no cap, no trim at all
 > answer, run `--raw`, or narrow with `--query` and read everything you
 > kept.
 
-### Fetching from cloud providers
+### Fetching from providers
+
+The window side rule has one source of truth (the warning above); the
+dedup tiers too. What follows is provider behavior only.
 
 `--gcloud`: `--since`/`--until` are pushed into the server-side filter
 as timestamp clauses, so the download only covers the window you asked
@@ -258,131 +260,90 @@ cardio cache.txt --query NTS    # local re-queries cost no fetch
 
 ## Flags
 
-The flags follow the read itself: first WHERE the log comes from, then
-how to narrow it, how to shape the output, how to analyze it, then the
-bq-specific extras, then runtime knobs and the two print modes.
+The flags follow the read itself. Where the rows leave defaults
+unstated, see the warning above: window, dedup and field cuts are
+covered there.
 
-### Sources (exactly one)
+Sources (exactly one):
 
-| Flag | Effect |
-|---|---|
-| `[file]` | Log file. If omitted, reads from stdin. |
-| `--gcloud FILTER` | Stream Cloud Logging entries matching this filter. `--since`/`--until` pushed server-side. |
-| `--bq SQL` | Run the bq CLI with this SQL and process its rows. Exactly one source at a time. |
-| `--k8s SELECTOR` | kubectl logs target (`pod/x`, `deployment/x`, bare name); `--since` pushes to `--since-time`. |
-| `-c, --container NAME` | With `--k8s`: the pod's container. |
+| Flag | What it does | Default |
+|---|---|---|
+| `[file]` | Log file. If omitted, reads from stdin. | stdin |
+| `--gcloud FILTER` | Stream Cloud Logging entries matching this filter; `--since`/`--until` pushed server-side. | none |
+| `--bq SQL` | Run the bq CLI with this SQL and process its rows. | none |
+| `--k8s SELECTOR` | kubectl logs target (`pod/x`, `deployment/x`, bare name); `--since` pushes to `--since-time`; `-c` picks the container. | kubectl's context and namespace |
 
-### Narrow the read
+Narrow the read:
 
-| Flag | Effect |
-|---|---|
-| `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
-| `--since TS` | Timestamp >= this. Accepts ISO (`2026-10-09T05:00:00`) or `YYYY-MM-DD` (day start). |
-| `--until TS` | Timestamp < this. ISO, or `YYYY-MM-DD` (NEXT-day start, so the end day is kept). |
+| Flag | What it does | Default |
+|---|---|---|
+| `--query TEXT` | Keep only lines containing TEXT (substring, applied first). | no filter |
+| `--since TS` | Timestamp >= this. ISO or `YYYY-MM-DD` (day start). | no lower bound |
+| `--until TS` | Timestamp < this. ISO or `YYYY-MM-DD` (next-day start, so the end day is kept). | no upper bound |
 
-### Shape the output
+Shape the output:
 
-| Flag | Effect |
-|---|---|
-| `--tail N` | Keep only the LAST N kept lines: most recent wins, whole input reads. The lean default for files/stdin. |
-| `--head N` | Keep only the FIRST N kept lines; the lean default for cloud fetchers. In `--trace`/`--summary` mode this is the event cap (earliest events win). |
-| `--skip N` | Drop the first N kept lines before the window. bq pages as `--skip 100 --head 100` (page 2). |
-| `--max-field-len N` | Cut any field (or whole line) longer than N chars, marked with "…". Lean default 1000; 0 = unlimited. |
+| Flag | What it does | Default |
+|---|---|---|
+| `--tail N` | Keep only the LAST N kept lines; whole input reads. | 2000 (lean, stream sources) |
+| `--head N` | Keep only the FIRST N kept lines; stops reads early. | 2000 (lean, fetchers); event cap in trace mode |
+| `--skip N` | Drop the first N kept lines before the window; bq pages as `--skip 100 --head 100` (page 2). | 0 |
+| `--max-field-len N` | Cut any field (or whole line) longer than N chars, marked with "…". | 1000 (lean; `--raw` never cuts); 0 = unlimited |
 
-### Pipeline levels
+Pipeline levels:
 
-| Flag | Effect |
-|---|---|
-| `--raw` | Skip the default pipeline: verbatim lines, no trim of timestamps or boilerplate, no dedup, no cap, no field cut. |
-| `--dedup` | Force dedup in `--raw` mode (lean mode already has dedup on). |
-| `--dedup-fold` | Third dedup level for censuses: lines differing only in digit runs collapse (digits become `#`, same fold as `--stats`); the run announces it on stderr. |
+| Flag | What it does | Default |
+|---|---|---|
+| `--raw` | Verbatim lines: no trim of timestamps or boilerplate, no dedup, no cap, no field cut. | lean pipeline is on |
+| `--dedup` | Force dedup in `--raw` mode. | on (lean) |
+| `--dedup-fold` | Census dedup: lines differing only in digit runs collapse (digits become `#`, same fold as `--stats`); announced on stderr. | off |
 
-### Analysis modes
+Analysis modes:
 
-| Flag | Effect |
-|---|---|
-| `--trace REGEX` | Group lines by captured ID, for example `"request_id=([a-z0-9-]+)"`. Sessions print at the end. |
-| `--summary` | With `--trace`: compact per-ID map with event count plus first and last events. IDs preserved. |
-| `--top N` | In trace mode (full or summary): keep only the biggest N sessions; the rest drop with a note. |
-| `--stats` | Survey mode: top 20 pattern frequencies on stderr, no stream output. Digit runs fold to `#` first, so `sid=123` and `sid=456` count as one pattern. `--stats --json` prints NDJSON `{"pattern","count"}` on stdout. |
-| `--group-col day,status` | bq census: count rows per column value, same output shape as `--stats` (NDJSON with `--json`). Rows are verbatim, so the column map matches the header. Only with `--bq`. |
+| Flag | What it does | Default |
+|---|---|---|
+| `--trace REGEX` | Group lines by captured ID (e.g. `"request_id=([a-z0-9-]+)"`); sessions print at the end. | off |
+| `--summary` | Compact per-ID map with event count plus first and last events; IDs preserved; needs `--trace` or config `default_trace`. | off |
+| `--top N` | In trace mode: keep only the biggest N sessions; the rest drop with a note. | no cap |
+| `--stats` | Survey mode: top 20 pattern frequencies on stderr; digit runs fold to `#` first, so `sid=123` and `sid=456` count as one pattern. | off |
+| `--group-col day,status` | bq census: count rows per column value, same output shape as `--stats`. Rows are verbatim, so the column map matches the header. | off |
 
-### Output format
+Output format:
 
-| Flag | Effect |
-|---|---|
-| `--json` | NDJSON output: `{"index","content"}` per line; with `--trace`, `{"id","events"}`; with `--summary`, `{"id","count","first","last"}`. |
+| Flag | What it does | Default |
+|---|---|---|
+| `--json` | NDJSON: `{"index","content"}` per line; with `--trace`, `{"id","events"}`; with `--summary`, `{"id","count","first","last"}`. | plain lines |
 
-### bq cost and execution extras
+bq cost and execution extras:
 
-| Flag | Effect |
-|---|---|
-| `--project ID` | bq only: the GCP project that runs the job (default = the CLI's configured project). |
-| `--max-bytes-billed N` | bq only: hard cap on billed bytes (errors instead of scanning multi-TB tables). |
-| `--dry-run` | bq only: cost estimate only, reads no rows. |
-| `--bq-args "--flag=..."` | bq only: extra raw bq CLI flags (whitespace-split, no quotes inside). |
+| Flag | What it does | Default |
+|---|---|---|
+| `--project ID` | The GCP project that runs the job. | the CLI's configured project |
+| `--max-bytes-billed N` | Hard cap on billed bytes (errors instead of scanning multi-TB tables). | off, unless `CARDIO_MAX_BYTES` is set |
+| `--dry-run` | Cost estimate only; reads no rows. | off |
+| `--bq-args "--flag=..."` | Extra raw bq CLI flags (whitespace-split, no quotes inside). | none |
 
-### Runtime and modes
+Runtime and modes:
 
-| Flag | Effect |
-|---|---|
-| `--timeout SECS` | Kill a hung fetcher after SECS (process-group kill; job id stays visible). Default 600 s on streaming fetchers (gcloud, k8s); bq waits whole jobs, so it needs an explicit `--timeout`. `0` disables. |
-| `--config FILE` | TOML with `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
-| `--mcp` | Run as an MCP stdio server exposing these modes as tools (below). |
-| `--agent-md` | Print the agent-facing markdown card (pipe it: `cardio --agent-md > AGENTS.md`). |
+| Flag | What it does | Default |
+|---|---|---|
+| `--timeout SECS` | Kill a hung fetcher after SECS (process-group kill on unix; job id stays visible). | 600 s on streaming fetchers (gcloud, k8s); bq waits whole jobs; on Windows only the direct child dies |
+| `--config FILE` | TOML with `timestamp_regex`, `boilerplate_regex`, `default_trace`. | none |
+| `--mcp` | Run as an MCP stdio server exposing these modes as tools. | off |
+| `--agent-md` | Print the agent-facing markdown card (pipe it: `cardio --agent-md > AGENTS.md`). | none |
 
-## MCP server: when to use it over the card
+## MCP server
 
-Two channels, one engine. The card (via `--agent-md`, or the AGENTS.md
-you dropped in your repo) teaches an agent that drives cardio through
-the shell. The MCP server serves agent runtimes that speak MCP: tools
-arrive through `tools/list` with the contract written into each schema
-(what the lean pipeline drops, that the window follows the source, that
-a wide bq scan should dry-run first). So:
-
-- **Shell plus card** is best when the agent composes freely (pipes,
-  follow-up greps, `cache.txt` flows). One card read amortizes over a
-  whole repo.
-- **MCP** is best for runtimes where structured tools beat prose:
-  schemas are always current because they ship with the binary itself.
-  A shell can drift if you skip re-reading the card; the MCP tools
-  cannot, since they are the same release.
-- Both channels stay honest the same way: what got dropped, field maps,
-  job ids and caps arrive as explicit content, never silent. (The
-  server also stays alive under load now: the 1.x core ran one request
-  at a time, so a slow fetch froze the whole server, pings went
-  unanswered, and agents watched the wait grow toward infinity. The 2.x
-  core never lets a tool call block the protocol.)
-
-The thread model:
-
-```
- stdin ──► READER thread ──► ping answered in µs, always
-             │               (it never blocks behind a tool call)
-             ├─ tools/call ─► WORKER thread (one per call)
-             │                 ├─ both pipes drained concurrently
-             │                 ├─ heartbeat every 10 s to the client
-             │                 ├─ cancel ─► child's PROCESS GROUP killed
-             │                 └─ max 2 heavy fetches; more QUEUE visibly
-             └──► WRITER thread (owns stdout, ONE channel, no races)
-                    └─ client's stdout dies ─► running fetches KILLED
-```
-
-The full reasoning (why std threads instead of an SDK, why process
-groups, why keep-first caps) is in the code docs: `src/mcp/mod.rs`,
-`src/mcp/worker.rs`.
-
-### It is NOT Google-only
-
-The headline tool is `fetch_command`: any log-producing CLI (Azure, AWS,
-journalctl, docker logs) pipes straight through cardio's lean pipeline.
-The named fetchers (`fetch_bq`, `fetch_gcloud`, `fetch_k8s`) exist only
-to add provider-specific superpowers (cost guards, server-side
-pushdown); for everything else, `fetch_command` is the tool.
-
-`cardio --mcp` speaks MCP (Model Context Protocol) over stdio: line-based
-JSON-RPC with tools/list and tools/call. Same binary, so the tools always
-match the flags. Eight tools:
+Two channels, one engine. The card teaches an agent that drives cardio
+through the shell; the MCP server serves runtimes that speak MCP: tools
+arrive through `tools/list` with the contract written into each schema,
+and the schemas ship with the binary, so they cannot drift from the
+flags. The server is concurrent: a ping answers in microseconds while a
+20-minute fetch runs, cancellation kills the fetch's process group, a
+dead client stops the spend, and heavy fetches are capped at 2 while
+the rest queue with progress. The details, with the thread diagram,
+live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the story of the
+1.x freeze is now in [CHANGELOG.md](CHANGELOG.md).
 
 | tool | purpose |
 |---|---|
@@ -390,36 +351,10 @@ match the flags. Eight tools:
 | `survey_log` | the `--stats --json` survey |
 | `trace_log` | the grouping modes (trace/summary/top/head-cap) |
 | `census_log` | bq census: rows-per-column-value counts (the `--group-col` semantics) |
-| `fetch_command` | ANY provider CLI piped through cardio: the provider-neutral fetch |
+| `fetch_command` | any provider CLI piped through cardio: the provider-neutral fetch |
 | `fetch_bq` | bq SQL with the cost guards (dry-run, byte caps, project) |
 | `fetch_gcloud` | Cloud Logging with pushdown bounds |
 | `fetch_k8s` | kubectl logs with the since-time pushdown |
-
-### The v2 server core: why it stays alive under load
-
-The 1.x server froze behind a slow tool call: one request at a time, the
-read loop never returned, pings went unanswered, and agents watched the
-wait grow toward infinity. The v2 core is concurrent:
-
-- one read thread owns stdin. `ping` answers in microseconds even while
-  a 20-minute bq runs.
-- one thread per `tools/call`. Heavy fetches run in parallel, capped at
-  2; the third queues with visible progress instead of hanging mute.
-- `notifications/cancelled` actually cancels: the fetch child (and its
-  whole process group on unix, so grandchildren cannot hold the pipes)
-  is killed on the spot and the run answers with an honest `isError`. On
-  Windows only the direct child dies; a CLI that spawns children may
-  keep them alive.
-- progress notifications flow whenever the client passes a progress
-  token: start plus a heartbeat every 10 s. "Working" never looks like
-  "hung" again.
-- both pipes are drained concurrently (a 1.0.0 run hung 30 minutes when
-  they were read sequentially). Oversized output is capped: 8 MiB
-  stdout, 64 KiB stderr, with an in-band truncation marker. The MCP
-  layer is a context window, not a filesystem.
-- a dead client stops the spend: if the client's stdout dies, the
-  writer notices once and every in-flight fetch is killed. In the 1.x
-  core a 20-minute bq finished for nobody.
 
 Results carry the trimmed lines plus cardio's stderr notes (what was
 dropped, bq column names, job ids) as separate text blocks; a nonzero
@@ -437,87 +372,38 @@ rest instead of shelling out: same engine, structured tools.
 ## Performance
 
 `./bench.sh` builds the release binary and times every mode on a
-synthetic 1M-line log (50% duplicate lines, digit ids, huge XML
+synthetic 1M-line log (~53 MB: 50% duplicate lines, digit ids, huge XML
 bodies). It uses hyperfine when installed and falls back to a plain
 monotonic-clock loop. Local snapshot (M1, release build):
 
-| mode | time per 1M lines |
-|---|---|
-| `cat` baseline | 0.01 s |
-| `--query` | 0.11 s |
-| `--raw` (no pipeline) | 0.21 s |
-| `--raw --dedup-fold` | 0.21 s |
-| `--trace` (raw, uncapped) | 0.38 s |
-| `--stats` | 0.68 s |
-| lean (trim + exact dedup + window + field cut) | 0.60 s |
+| mode | median | throughput |
+|---|---|---|
+| `cat` baseline | 0.012 s | ~4.5 GB/s |
+| `--query` | 0.111 s | ~480 MB/s |
+| `--raw` (pipeline off) | 0.210 s | ~250 MB/s |
+| `--raw --dedup-fold` | 0.209 s | ~250 MB/s (the fold is one regex pass) |
+| `--trace` (raw, uncapped) | 0.380 s | ~140 MB/s |
+| lean (trim + exact dedup + window + field cut) | 0.600 s | ~88 MB/s |
+| `--stats` | 0.680 s | ~78 MB/s |
 
-The badge at the top shows the live lean number, measured by CI on
-GitHub's ubuntu runners after every release (and on demand via
-workflow_dispatch); full per-mode tables sit at the badge's link. The
-table above is one local M1 run for orientation; on other hardware, run
-`./bench.sh` and read your own numbers.
+The badge at the top shows the live lean number measured by CI on
+GitHub's ubuntu runners after every release; on other hardware run
+`./bench.sh` and read your own numbers. The bench's trace scenario
+runs with `--raw` on purpose: in lean mode the session cap bounds the
+input early, so its time would measure the cap rather than the grouper.
+The methodology lives in `bench.sh` itself.
 
-Roughly 75 MB/s on the lean path end to end, with the 1000-char field
-cutoff included (byte-length fast path). The trim runs as a single
-combined regex pass, and `--dedup-fold` costs nothing over raw (the
-fold is one regex pass over the line). When the input comes from gcloud
-or bq the network dominates anyway. The bench's trace scenario runs
-with `--raw` on purpose: in lean mode the session cap bounds the input
-early, so its time would measure the cap rather than the grouper.
+## License
 
-## Tests
+Apache-2.0. See [LICENSE](LICENSE) for the full text.
 
-```bash
-cargo test    # unit + integration: the CLI contract (tests/cli.rs), a real MCP stdio drive (tests/mcp.rs), fake fetchers per OS (sh stubs on unix, .cmd stubs on Windows)
-```
+Contributions: open an issue first and let's discuss before a PR; the
+codebase is small and opinionated on purpose.
 
-Philosophy: black-box, at the CLI level. Tests pin the promises the
-agent card makes (trim behavior, dedup honesty, window semantics, exit
-codes, stderr witnesses, JSON shapes). Because of that they survive
-refactors, and any drift between docs and behavior fails loudly.
-gcloud and bq are faked with PATH-stub shell scripts (marked
-`#[cfg(unix)]`), so the whole suite runs offline on every OS. A
-staleness test makes every clap flag appear in the agent card, so the
-card can only go stale by leaving a flag out on purpose. Unit tests
-exist only for pure math that a CLI test cannot probe sanely, such as
-calendar rollovers and the 9999-12-31 clamp.
+## Where the rest lives
 
-Coverage (cargo llvm-cov, the `coverage` job): ~89% and held ≥80% by
-the gate of taste, not a hard rule. The MCP layer is measured
-separately: its tests drive the spawned binary over stdio, which llvm
-tooling cannot attribute to source. The layer is excluded from the
-ratio instead of pretending it is untested.
-
-## Time handling
-
-ISO timestamps compare lexicographically, so string order equals time
-order. Timezone offsets are matched and trimmed for comparison, but the
-comparison is tz-naive: mixing `+02:00`-suffixed logs with UTC bounds
-can misjudge hours around day boundaries.
-
-## Config example
-
-```toml
-timestamp_regex = '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}'
-boilerplate_regex = '(?i)\b(INFO|DEBUG|TRACE)\b'
-default_trace = 'trace_id=([a-zA-Z0-9-]+)'
-```
-
-## Examples
-
-```bash
-# agent-ready error digest
-cardio app.log --query error --json | agent
-
-# what happened to one request
-cardio app.log --trace 'req_id=([a-z0-9-]+)'
-
-# same, compact: first/last event + count per request
-cardio app.log --trace 'req_id=([a-z0-9-]+)' --summary
-
-# survey a 10GB log without streaming output
-cardio huge.log --stats
-
-# one pod's recent errors
-cardio --k8s deployment/my-api --since 2026-10-09 --query error
-```
+The MCP thread model, the core's whys, time handling (tz-naive
+comparisons: string order equals time order, but mixed `+02:00` logs
+against UTC bounds can misjudge day edges) and the test philosophy live
+in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the release history in
+[CHANGELOG.md](CHANGELOG.md).
