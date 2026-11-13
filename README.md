@@ -258,33 +258,74 @@ cardio cache.txt --query NTS    # local re-queries cost no fetch
 
 ## Flags
 
+The flags follow the read itself: first WHERE the log comes from, then
+how to narrow it, how to shape the output, how to analyze it, then the
+bq-specific extras, then runtime knobs and the two print modes.
+
+### Sources (exactly one)
+
 | Flag | Effect |
 |---|---|
 | `[file]` | Log file. If omitted, reads from stdin. |
-| `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
-| `--since TS` | Timestamp >= this. Accepts ISO (`2026-10-09T05:00:00`) or `YYYY-MM-DD` (day start). |
-| `--until TS` | Timestamp < this. ISO, or `YYYY-MM-DD` (NEXT-day start, so the end day is kept). |
-| `--tail N` | Keep only the LAST N kept lines: most recent wins, whole input reads. The lean default for files/stdin. |
-| `--head N` | Keep only the FIRST N kept lines; the lean default for cloud fetchers. In `--trace`/`--summary` mode this is the event cap (earliest events win). |
-| `--skip N` | Drop the first N kept lines before the window. bq pages as `--skip 100 --head 100` (page 2). |
-| `--raw` | Skip the default pipeline: verbatim lines, no trim of timestamps or boilerplate, no dedup, no cap, no field cut. |
-| `--dedup` | Force dedup in `--raw` mode (lean mode already has dedup on). |
-| `--max-field-len N` | Cut any field (or whole line) longer than N chars, marked with "…". Lean default 1000; 0 = unlimited. |
-| `--json` | NDJSON output: `{"index","content"}` per line; with `--trace`, `{"id","events"}`; with `--summary`, `{"id","count","first","last"}`. |
-| `--trace REGEX` | Group lines by captured ID, for example `"request_id=([a-z0-9-]+)"`. Sessions print at the end. |
-| `--summary` | With `--trace`: compact per-ID map with event count plus first and last events. IDs preserved. |
-| `--top N` | In trace mode (full or summary): keep only the biggest N sessions; the rest drop with a note. |
-| `--stats` | Survey mode: top 20 pattern frequencies on stderr, no stream output. Digit runs fold to `#` first, so `sid=123` and `sid=456` count as one pattern. `--stats --json` prints NDJSON `{"pattern","count"}` on stdout. |
-| `--dedup-fold` | Third dedup level for censuses: lines differing only in digit runs collapse (digits become `#`, same fold as `--stats`); the run announces it on stderr. |
-| `--group-col day,status` | bq census: count rows per column value, same output shape as `--stats` (NDJSON with `--json`). Rows are verbatim, so the column map matches the header. Only with `--bq`. |
 | `--gcloud FILTER` | Stream Cloud Logging entries matching this filter. `--since`/`--until` pushed server-side. |
 | `--bq SQL` | Run the bq CLI with this SQL and process its rows. Exactly one source at a time. |
 | `--k8s SELECTOR` | kubectl logs target (`pod/x`, `deployment/x`, bare name); `--since` pushes to `--since-time`. |
 | `-c, --container NAME` | With `--k8s`: the pod's container. |
+
+### Narrow the read
+
+| Flag | Effect |
+|---|---|
+| `--query TEXT` | Keep only lines containing TEXT (substring, applied first). |
+| `--since TS` | Timestamp >= this. Accepts ISO (`2026-10-09T05:00:00`) or `YYYY-MM-DD` (day start). |
+| `--until TS` | Timestamp < this. ISO, or `YYYY-MM-DD` (NEXT-day start, so the end day is kept). |
+
+### Shape the output
+
+| Flag | Effect |
+|---|---|
+| `--tail N` | Keep only the LAST N kept lines: most recent wins, whole input reads. The lean default for files/stdin. |
+| `--head N` | Keep only the FIRST N kept lines; the lean default for cloud fetchers. In `--trace`/`--summary` mode this is the event cap (earliest events win). |
+| `--skip N` | Drop the first N kept lines before the window. bq pages as `--skip 100 --head 100` (page 2). |
+| `--max-field-len N` | Cut any field (or whole line) longer than N chars, marked with "…". Lean default 1000; 0 = unlimited. |
+
+### Pipeline levels
+
+| Flag | Effect |
+|---|---|
+| `--raw` | Skip the default pipeline: verbatim lines, no trim of timestamps or boilerplate, no dedup, no cap, no field cut. |
+| `--dedup` | Force dedup in `--raw` mode (lean mode already has dedup on). |
+| `--dedup-fold` | Third dedup level for censuses: lines differing only in digit runs collapse (digits become `#`, same fold as `--stats`); the run announces it on stderr. |
+
+### Analysis modes
+
+| Flag | Effect |
+|---|---|
+| `--trace REGEX` | Group lines by captured ID, for example `"request_id=([a-z0-9-]+)"`. Sessions print at the end. |
+| `--summary` | With `--trace`: compact per-ID map with event count plus first and last events. IDs preserved. |
+| `--top N` | In trace mode (full or summary): keep only the biggest N sessions; the rest drop with a note. |
+| `--stats` | Survey mode: top 20 pattern frequencies on stderr, no stream output. Digit runs fold to `#` first, so `sid=123` and `sid=456` count as one pattern. `--stats --json` prints NDJSON `{"pattern","count"}` on stdout. |
+| `--group-col day,status` | bq census: count rows per column value, same output shape as `--stats` (NDJSON with `--json`). Rows are verbatim, so the column map matches the header. Only with `--bq`. |
+
+### Output format
+
+| Flag | Effect |
+|---|---|
+| `--json` | NDJSON output: `{"index","content"}` per line; with `--trace`, `{"id","events"}`; with `--summary`, `{"id","count","first","last"}`. |
+
+### bq cost and execution extras
+
+| Flag | Effect |
+|---|---|
 | `--project ID` | bq only: the GCP project that runs the job (default = the CLI's configured project). |
 | `--max-bytes-billed N` | bq only: hard cap on billed bytes (errors instead of scanning multi-TB tables). |
 | `--dry-run` | bq only: cost estimate only, reads no rows. |
 | `--bq-args "--flag=..."` | bq only: extra raw bq CLI flags (whitespace-split, no quotes inside). |
+
+### Runtime and modes
+
+| Flag | Effect |
+|---|---|
 | `--timeout SECS` | Kill a hung fetcher after SECS (process-group kill; job id stays visible). Default 600 s on streaming fetchers (gcloud, k8s); bq waits whole jobs, so it needs an explicit `--timeout`. `0` disables. |
 | `--config FILE` | TOML with `timestamp_regex`, `boilerplate_regex`, `default_trace`. |
 | `--mcp` | Run as an MCP stdio server exposing these modes as tools (below). |
