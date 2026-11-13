@@ -69,8 +69,7 @@ jobs:
           git clone -q --depth=1 --branch=gh-pages "$URL" ghp \
             || { mkdir ghp && git -C ghp init -q -b gh-pages && git -C ghp remote add origin "$URL"; }
           mv coverage.svg ghp/coverage.svg
-          mv lcov.info ghp/lcov.info
-          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add coverage.svg lcov.info
+          git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com add coverage.svg
           git -C ghp -c user.name=Red-CF -c user.email=crojasfer31@gmail.com commit -q -m "coverage badge: $PCT%" --allow-empty
           git -C ghp push -q origin gh-pages
 

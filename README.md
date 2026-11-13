@@ -1,7 +1,7 @@
 # log-cardio 🏃🏼‍♂️
 
 [![CI](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml/badge.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
-[![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/coverage.svg)](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/lcov.info)
+[![coverage](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/coverage.svg)](https://github.com/Red-CF/log-cardio/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/log-cardio.svg)](https://crates.io/crates/log-cardio)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![bench](https://raw.githubusercontent.com/Red-CF/log-cardio/gh-pages/bench.svg)](https://htmlpreview.github.io/?https://github.com/Red-CF/log-cardio/blob/gh-pages/bench.html)
