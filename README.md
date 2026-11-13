@@ -10,41 +10,6 @@
 cardio is a fast Rust CLI that trims logs so LLM agents read them with a
 fraction of the tokens.
 
-## Before and after
-
-```
-$ wc -l app.log
-1204331 app.log
-
-$ cardio app.log | wc -l
-2000
-```
-
-stderr, during the run:
-
-```
-Note: dedup dropped 812431 repeat lines. Under the 5000-unique-lines
-mark dedup is exact; above it, a few may actually be unique.
-Note: kept the last 2000 lines (the most recent); the rest of the
-input was read and trimmed (--raw removes the cap; --query TEXT
-narrows before reading).
-```
-
-And a raw sample against the output:
-
-```
-raw:                                            output:
-2026-10-09T12:00:00Z INFO auth: login ok    ->  auth: login ok user=carlos
-2026-10-09T12:00:03Z INFO auth: login ok    ->  (repeated: collapsed)
-2026-10-09T12:00:09Z DEBUG auth: refresh    ->  auth: refresh attempt
-2026-10-09T12:00:12Z ERROR auth: expired    ->  ERROR auth: expired user=carlos
-2026-10-09T12:00:15Z INFO api: 12ms         ->  api: request served in 12ms
-```
-
-Nothing that mattered was lost: repeats are gone, DEBUG boilerplate is
-stripped, and the ERROR keeps its level because the trim only shreds
-INFO/DEBUG/TRACE.
-
 ## Who is cardio for?
 
 - **You debug with LLM agents** (Claude Code, Codex, Cursor...) and are
